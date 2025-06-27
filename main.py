@@ -8,7 +8,7 @@ from modules import qiime_wrapper
 
 from modules import iterators
 
-PROJECT_BASE = Path("/mnt/c/Users/erick/Documents/metagenomics-test")
+PROJECT_BASE = Path("/mnt/c/Users/esamera/Documents/github/metagenomics-test")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -23,15 +23,12 @@ def main():
 
     io_utils.generate_manifest(PROJECT_BASE.joinpath('fastq'))
 
-    # qiime_wrapper.import_data(
-    #     input_path=PROJECT_BASE / 'fastq' / 'fastq.manifest',
-    #     output_path=PROJECT_BASE / 'output.qza'
-    # )
-
-    iterators.get_optimal_trimming(imported_qza=PROJECT_BASE / 'output.qza')
-
-    log.info("asdasdasd")
-    
+    qiime_wrapper.import_data(
+        input_path=PROJECT_BASE / 'fastq' / 'fastq.manifest',
+        output_path=PROJECT_BASE / 'output.qza',
+        dry_run=False
+    )
+    iterators.get_optimal_trimming(imported_qza=PROJECT_BASE / 'output.qza')    
 
 if __name__ == "__main__":
     main()

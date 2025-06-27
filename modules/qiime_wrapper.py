@@ -10,10 +10,10 @@ from typing import Optional
 logger = logging.getLogger("qiime_pipeline")
 
 def import_data(
+        input_path: Path,
+        output_path: Path,
         import_type: str = "SampleData[PairedEndSequencesWithQuality]",
         input_format: str = "PairedEndFastqManifestPhred33V2",
-        input_path: Optional[Path] = None,
-        output_path: Optional[Path] = None,
         dry_run: bool = False,
         show_qiime: bool = False,
     ) -> None:
@@ -35,9 +35,13 @@ def import_data(
     log_success("Import completed.")
 
 def dada2_denoise_paired(
-        input_seqs: Optional[Path] = None,
-        trunc_len_f: Optional[int] = None,
-        trunc_len_r: Optional[int] = None,
+        input_seqs:  Path,
+        trunc_len_f: int,
+        trunc_len_r: int,
+
+        output_table: Path,
+        output_rep_seqs: Path,
+        output_denoising_stats: Path,
 
         trim_left_f: int = 0,
         trim_left_r: int = 0,
@@ -59,20 +63,16 @@ def dada2_denoise_paired(
         hashed_feature_ids: bool = True,
         retain_all_samples: bool = True,
 
-        output_table: Optional[Path] = None,
-        output_rep_seqs: Optional[Path] = None,
-        output_denoising_stats: Optional[Path] = None,
-
         dry_run: bool = False,
         show_qiime: bool = False
     ) -> None:
     """
     """
 
-    if not any(x is None for x in [input_seqs, trunc_len_f, trunc_len_r,]):
+    if any(x is None for x in [input_seqs, trunc_len_f, trunc_len_r,]):
         raise ValueError("All of these [input_seqs, trunc_len_f, trunc_len_r] must be provided.")
     
-    if not any(x is None for x in [output_table, output_rep_seqs, output_denoising_stats,]):
+    if any(x is None for x in [output_table, output_rep_seqs, output_denoising_stats,]):
         raise ValueError("All of these [output_table, output_rep_seqs, output_denoising_stats] must be provided.")
 
     if min_overlap < 4:
@@ -115,4 +115,16 @@ def dada2_denoise_paired(
 
     log_success("Import completed.")
 
+def feature_table_summarize(
+        input_table: Path,
+        output: Path,
+        dry_run: bool = False,
+        show_qiime: bool = False
+    ) -> None:
+
+    run_command([
+        "qiime", "feature-table", "summarize",
+        "--i-table", str(input_table),
+        "--o-visualization", str(output),
+        ], dry_run, capture=not show_qiime)
 # ---
