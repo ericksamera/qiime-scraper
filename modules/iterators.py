@@ -1,17 +1,14 @@
 # modules/iterators.py
 
-from pathlib import Path
-from .io_utils import run_command
-from .logger import log_success
+import json
 import logging
-from modules import qiime_wrapper
-from typing import Optional
-import json, re, statistics, zipfile
+import re
+import statistics
 import zipfile
-
-import statistics, zipfile, json, re
 from pathlib import Path
 from typing import Optional, Tuple
+
+from modules import qiime_wrapper
 
 logger = logging.getLogger("qiime_pipeline")
 
@@ -119,3 +116,5 @@ def get_optimal_trimming(
     logger.info("Optimal trimming saved: %s", best_pair)
 
     return best_pair
+
+# ---

@@ -1,11 +1,10 @@
 # modules/qiime_wrapper.py
 
+import logging
 from pathlib import Path
+
 from .io_utils import run_command
 from .logger import log_success
-import logging
-
-from typing import Optional
 
 logger = logging.getLogger("qiime_pipeline")
 

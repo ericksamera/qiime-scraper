@@ -1,15 +1,14 @@
 # modules/io_utils.py
 
-import subprocess
-from pathlib import Path
-from logging import Logger
-from typing import List, Optional
-import logging
-import time
-
 import csv
+import logging
+import subprocess
+import time
+from logging import Logger
+from pathlib import Path
+from typing import List, Optional
 
-from .logger import log_success
+from modules.logger import log_success
 
 logger = logging.getLogger("qiime_pipeline")
 

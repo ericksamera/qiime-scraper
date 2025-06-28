@@ -1,34 +1,46 @@
 # main.py
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
-from modules import logger
-from modules import io_utils
-from modules import qiime_wrapper
 
-from modules import iterators
+from modules import io_utils, iterators, logger, qiime_wrapper
 
-PROJECT_BASE = Path("/mnt/c/Users/esamera/Documents/github/metagenomics-test")
+@dataclass
+class Args:
+    fastq_dir: Path
+    dry_run: bool = False
 
-def main():
+def get_args() -> Args:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--fastq-dir",
+        type=Path,
+        required=True,
+        help="Directory containing .fastq.gz files.")
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands without executing")
-
+    
     args = parser.parse_args()
+    return Args(**vars(args))
+
+def main() -> None:
+
+    args = get_args()
 
     log = logger.setup_logger()
 
-    io_utils.generate_manifest(PROJECT_BASE.joinpath('fastq'))
+    io_utils.generate_manifest(args.fastq_dir)
 
     qiime_wrapper.import_data(
-        input_path=PROJECT_BASE / 'fastq' / 'fastq.manifest',
-        output_path=PROJECT_BASE / 'output.qza',
+        input_path=args.fastq_dir.joinpath('fastq.manifest'),
+        output_path=args.fastq_dir.joinpath('output.qza'),
         dry_run=False
     )
-    iterators.get_optimal_trimming(imported_qza=PROJECT_BASE / 'output.qza')    
+
+    iterators.get_optimal_trimming(imported_qza=args.fastq_dir.joinpath('output.qza'))
 
 if __name__ == "__main__":
     main()
