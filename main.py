@@ -32,7 +32,7 @@ def main() -> None:
 
     log = logger.setup_logger()
 
-    io_utils.generate_manifest(args.fastq_dir)
+    io_utils.generate_manifest(args.fastq_dir.resolve())
 
     qiime_wrapper.import_data(
         input_path=args.fastq_dir.joinpath('fastq.manifest'),
