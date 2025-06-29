@@ -32,15 +32,17 @@ def main() -> None:
 
     log = logger.setup_logger()
 
-    io_utils.generate_manifest(args.fastq_dir.resolve())
+    project_fastq_dir: Path = args.fastq_dir.resolve()
+
+    io_utils.generate_manifest(project_fastq_dir)
 
     qiime_wrapper.import_data(
-        input_path=args.fastq_dir.joinpath('fastq.manifest'),
-        output_path=args.fastq_dir.joinpath('output.qza'),
+        input_path=project_fastq_dir.joinpath('fastq.manifest'),
+        output_path=project_fastq_dir.joinpath('output.qza'),
         dry_run=False
     )
 
-    iterators.get_optimal_trimming(imported_qza=args.fastq_dir.joinpath('output.qza'))
+    iterators.get_optimal_trimming(imported_qza=project_fastq_dir.joinpath('output.qza'))
 
 if __name__ == "__main__":
     main()
