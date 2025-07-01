@@ -23,6 +23,10 @@ def import_data(
     if output_path.exists() and output_path.is_dir():
         raise ValueError(f"Expected output_path to be a file, not a directory: {output_path}")
 
+    if output_path.exists():
+        logger.info(f"{output_path} alread exists.")
+        return
+
     run_command([
         "qiime", "tools", "import",
         "--type", import_type,
