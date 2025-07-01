@@ -63,7 +63,9 @@ def get_optimal_trimming(
         table_qza = out / f"{tag}_output_table.qza"
         table_qzv = out / f"{tag}_output_table.qzv"
 
-        if not table_qzv.exists():
+        if table_qzv.exists():
+            logger.info(f"{table_qzv} exists, skipping.")
+        else:
             qiime_wrapper.dada2_denoise_paired(
                 input_seqs=imported_qza,
                 trunc_len_f=f,

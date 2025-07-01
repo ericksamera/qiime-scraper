@@ -24,7 +24,7 @@ def import_data(
         raise ValueError(f"Expected output_path to be a file, not a directory: {output_path}")
 
     if output_path.exists():
-        logger.info(f"{output_path} alread exists.")
+        logger.info(f"{output_path} already exists.")
         return
 
     run_command([
