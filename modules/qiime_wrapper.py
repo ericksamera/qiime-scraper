@@ -3,6 +3,8 @@
 import logging
 from pathlib import Path
 
+from typing import Union
+
 from .io_utils import run_command
 from .logger import log_success
 
@@ -136,7 +138,7 @@ def classify_sklearn(
         input_classifier: Path,
         output_classification: Path,
 
-        reads_per_batch: str = 'auto',
+        reads_per_batch: str | int = 'auto',
         n_jobs: int = 0,
         pre_dispatch: str = '2*n_jobs',
         confidence: float = 0.7,

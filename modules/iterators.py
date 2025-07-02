@@ -218,6 +218,7 @@ def get_optimal_classifier(
                 input_reads=imported_qza,
                 input_classifier=cls,
                 output_classification=classification,
+                reads_per_batch=5000,
             )
 
         metrics = _extract_classification_metrics(classification)
