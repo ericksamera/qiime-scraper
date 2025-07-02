@@ -44,6 +44,10 @@ def main() -> None:
 
     iterators.get_optimal_trimming(imported_qza=project_fastq_dir.joinpath('output.qza'))
 
+    iterators.get_optimal_classifier(
+        imported_qza=project_fastq_dir.joinpath('output.qza'),
+        classifiers_dir=Path('/home/erick/qiime'))
+
 if __name__ == "__main__":
     main()
 # ---

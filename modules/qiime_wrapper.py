@@ -29,16 +29,16 @@ def import_data(
 
     run_command([
         "qiime", "tools", "import",
-        "--type", import_type,
+        "--type",         import_type,
         "--input-format", input_format,
-        "--input-path", str(input_path),
-        "--output-path", str(output_path)
+        "--input-path",   str(input_path),
+        "--output-path",  str(output_path)
     ], dry_run, capture=not show_qiime)
 
     log_success("Import completed.")
 
 def dada2_denoise_paired(
-        input_seqs:  Path,
+        input_seqs: Path,
         trunc_len_f: int,
         trunc_len_r: int,
 
@@ -92,28 +92,28 @@ def dada2_denoise_paired(
 
     run_command([
         "qiime", "dada2", "denoise-paired",
-        "--i-demultiplexed-seqs", str(input_seqs),
-        "--p-trunc-len-f", str(trunc_len_f),
-        "--p-trunc-len-r", str(trunc_len_r),
+        "--i-demultiplexed-seqs",             str(input_seqs),
+        "--p-trunc-len-f",                    str(trunc_len_f),
+        "--p-trunc-len-r",                    str(trunc_len_r),
 
-        "--p-trim-left-f", str(trim_left_f),
-        "--p-trim-left-r", str(trim_left_r),
-        "--p-max-ee-f", str(max_ee_f),
-        "--p-max-ee-r", str(max_ee_r),
-        "--p-trunc-q", str(trunc_q),
-        "--p-min-overlap", str(min_overlap),
-        "--p-pooling-method", pooling_method,
-        "--p-chimera-method", chimera_method,
+        "--p-trim-left-f",                    str(trim_left_f),
+        "--p-trim-left-r",                    str(trim_left_r),
+        "--p-max-ee-f",                       str(max_ee_f),
+        "--p-max-ee-r",                       str(max_ee_r),
+        "--p-trunc-q",                        str(trunc_q),
+        "--p-min-overlap",                    str(min_overlap),
+        "--p-pooling-method",                 pooling_method,
+        "--p-chimera-method",                 chimera_method,
         "--p-min-fold-parent-over-abundance", str(min_fold_parent_over_abundance),
         "--p-allow-one-off" if allow_one_off else "--p-no-allow-one-off",
-        "--p-n-threads", str(n_threads),
-        "--p-n-reads-learn", str(n_reads_learn),
+        "--p-n-threads",                      str(n_threads),
+        "--p-n-reads-learn",                  str(n_reads_learn),
         "--p-hashed-feature-ids" if hashed_feature_ids else "--p-no-hashed-feature-ids",
         "--p-retain-all-samples" if retain_all_samples else "--p-no-retain-all-samples",
 
-        "--o-table", str(output_table), 
-        "--o-representative-sequences", str(output_rep_seqs),
-        "--o-denoising-stats", str(output_denoising_stats)
+        "--o-table",                          str(output_table), 
+        "--o-representative-sequences",       str(output_rep_seqs),
+        "--o-denoising-stats",                str(output_denoising_stats)
     ], dry_run, capture=not show_qiime)
 
     log_success("Import completed.")
@@ -127,7 +127,35 @@ def feature_table_summarize(
 
     run_command([
         "qiime", "feature-table", "summarize",
-        "--i-table", str(input_table),
+        "--i-table",         str(input_table),
         "--o-visualization", str(output),
         ], dry_run, capture=not show_qiime)
+
+def classify_sklearn(
+        input_reads: Path,
+        input_classifier: Path,
+        output_classification: Path,
+
+        reads_per_batch: str = 'auto',
+        n_jobs: int = 0,
+        pre_dispatch: str = '2*n_jobs',
+        confidence: float = 0.7,
+        read_orientation: str = 'auto',
+
+        dry_run: bool = False,
+        show_qiime: bool = False
+    ) -> None:
+
+    run_command([
+        "qiime", "feature-classifier", "classify-sklearn",
+        "--i-reads",             str(input_reads),
+        "--i-classifier",        str(input_classifier),
+        "--o-classification",    str(output_classification),
+        "--p-reads-per-batch",   str(reads_per_batch),
+        "--p-n-jobs",            str(n_jobs),
+        "--p-pre-dispatch",      str(pre_dispatch),
+        "--p-confidence",        str(confidence),
+        "--p-read-orientation",  str(read_orientation)
+        ], dry_run, capture=not show_qiime)
+
 # ---
