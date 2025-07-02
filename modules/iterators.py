@@ -8,6 +8,8 @@ import zipfile
 from pathlib import Path
 from typing import Optional, Tuple, List, Sequence, Dict
 
+import heapq
+
 from modules import qiime_wrapper
 
 logger = logging.getLogger("qiime_pipeline")
@@ -193,7 +195,7 @@ def get_optimal_classifier(
     classifiers_dir: Path,
     *,
     keys: Sequence[str] = ("pct_depth≥7", "median_conf", "mean_conf"),
-) -> Dict[str, Path]:
+) -> Dict[str, list[Path]]:
     """Run each classifier and pick the best for every metric in *keys*.
 
     Returns a mapping ``metric → classifier_path``.
@@ -233,26 +235,31 @@ def get_optimal_classifier(
     metric_map: Dict[Path, dict] = {p: m for p, m in scores}
 
     # determine leader per metric -------------------------------------
-    leaders: Dict[str, Path] = {}
+    top_leaders: Dict[str, list[Path]] = {}
     for k in keys:
-        best_cls, best_met = max(scores, key=lambda t: _score(t[1], k))
-        leaders[k] = best_cls
-        logger.info("Best %s: %s (value=%s)", k, best_cls.name, best_met.get(k))
+        top_two = heapq.nlargest(2, scores, key=lambda t: _score(t[1], k))
+        top_leaders[k] = [cls for cls, _ in top_two]
+        for i, (cls, met) in enumerate(top_two, 1):
+            logger.info("Top %d %s: %s (value=%s)", i, k, cls.name, met.get(k))
 
     # persist winners --------------------------------------------------
     with (out / "optimal_classifiers.json").open("w") as fh:
         json.dump(
             {
-                k: {
-                    "classifier": leaders[k].name,
-                    "value": metric_map[leaders[k]].get(k),
-                }
-                for k in leaders
+                k: [
+                    {
+                        "classifier": cls.name,
+                        "value": metric_map[cls].get(k),
+                    }
+                    for cls in top_leaders[k]
+                ]
+                for k in top_leaders
             },
             fh,
             indent=2,
         )
 
-    return leaders
+    return top_leaders
+
 
 # -----------------------------------------------------------------------------
