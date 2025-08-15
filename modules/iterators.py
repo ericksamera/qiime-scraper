@@ -14,15 +14,29 @@ from modules import qiime_wrapper
 
 logger = logging.getLogger("qiime_pipeline")
 
+# ---------------------------------------------------------------------
+# helpers: workdir + html data extraction
+# ---------------------------------------------------------------------
+
+def _find_work_dir(p: Path) -> Path:
+    """Return the nearest ancestor named '.work', or create '<p.parent>/.work' if missing."""
+    p = p.resolve()
+    for parent in [p] + list(p.parents):
+        if parent.name == ".work":
+            return parent
+    fallback = p.parent / ".work"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
 
 _SCRIPT_RE = re.compile(
     r'<script[^>]*id=["\']table-data["\'][^>]*>\s*(\{.*?\})\s*</script>',
     re.I | re.S,
 )
 
-# -----------------------------------------------------------------------------
-# helper: sample‑frequency median
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# helper: sample-frequency median
+# ---------------------------------------------------------------------
 
 def _extract_median(qzv: Path) -> Optional[int]:
     """Return the median Frequency value contained in *qzv* or **None**."""
@@ -47,9 +61,9 @@ def _extract_median(qzv: Path) -> Optional[int]:
     except Exception:
         return None
 
-# -----------------------------------------------------------------------------
-# brute‑force trimming search
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# brute-force trimming search
+# ---------------------------------------------------------------------
 
 def get_optimal_trimming(
     imported_qza: Path,
@@ -58,9 +72,10 @@ def get_optimal_trimming(
     min_len: int = 200,
     step: int = 25,
 ) -> Tuple[int, int]:
-    """Return the trunc‑len pair (F, R) that maximises median sample frequency."""
+    """Return the trunc-len pair (F, R) that maximises median sample frequency."""
 
-    out = imported_qza.parent / ".work" / ".optimal_trimming"
+    # Keep trimming results under the project-level .work (same as your original layout)
+    out = _find_work_dir(imported_qza) / "optimal_trimming"
     out.mkdir(parents=True, exist_ok=True)
 
     def run_pair(f: int, r: int) -> Optional[int]:
@@ -84,30 +99,46 @@ def get_optimal_trimming(
         return _extract_median(table_qzv)
 
     # --- coarse search -------------------------------------------------
-    coarse = [
-        ((f, r), s)
-        for f in range(min_len, max_len + 1, step)
-        for r in range(min_len, max_len + 1, step)
-        if (s := run_pair(f, r)) is not None
-    ]
+    coarse: List[Tuple[Tuple[int, int], int]] = []
+    for f in range(min_len, max_len + 1, step):
+        for r in range(min_len, max_len + 1, step):
+            score = run_pair(f, r)
+            if score is not None:
+                coarse.append(((f, r), score))
+
     if not coarse:
         raise RuntimeError("No valid scores produced.")
 
     best_score = max(s for _, s in coarse)
     seeds = [p for p, s in coarse if s >= 0.9 * best_score]
 
-    # --- fine search ---------------------------------------------------
-    fine = [
-        ((f, r), s)
-        for f_base, r_base in seeds
-        for f in range(f_base - 10, f_base + 11, 5)
-        for r in range(r_base - 10, r_base + 11, 5)
-        if min_len <= f <= max_len
-        if min_len <= r <= max_len
-        if (s := run_pair(f, r)) is not None
-    ]
+    # --- fine search around top coarse seeds ---------------------------
+    def neighbors(f: int, r: int, delta: int = max(1, step // 5)) -> List[Tuple[int, int]]:
+        cand = []
+        for df in (-delta, 0, +delta):
+            for dr in (-delta, 0, +delta):
+                nf, nr = f + df, r + dr
+                if nf < min_len or nr < min_len or nf > max_len or nr > max_len:
+                    continue
+                cand.append((nf, nr))
+        return list(dict.fromkeys(cand))  # unique, preserve order
 
-    best_pair, best_score = max(fine, key=lambda x: x[1])
+    tried = {tuple(p) for p, _ in coarse}
+    fine: List[Tuple[Tuple[int, int], int]] = []
+    for f, r in seeds:
+        for nf, nr in neighbors(f, r):
+            if (nf, nr) in tried:
+                continue
+            score = run_pair(nf, nr)
+            if score is not None:
+                fine.append(((nf, nr), score))
+            tried.add((nf, nr))
+
+    if not fine:
+        # If nothing improved, fall back to the best coarse pair
+        best_pair, best_score = max(coarse, key=lambda x: x[1])
+    else:
+        best_pair, best_score = max(fine, key=lambda x: x[1])
 
     with (out / "optimal_trimming.json").open("w") as fh:
         json.dump(
@@ -123,9 +154,9 @@ def get_optimal_trimming(
 
     return best_pair
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # helper: classification metrics
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 def _extract_classification_metrics(qza: Path, min_depth: int = 5) -> Optional[dict]:
     """Return summary metrics for the taxonomy assignments in *qza*."""
@@ -178,17 +209,17 @@ def _extract_classification_metrics(qza: Path, min_depth: int = 5) -> Optional[d
         f"n_depth≥{min_depth}": sum(d >= min_depth for d in depths),
     }
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # helper: simple metric picker
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 def _score(m: dict, k: str) -> float:
     """Return metric *k* from *m* or 0 if absent."""
     return m.get(k, 0.0)
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 # classifier picker
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
 
 def get_optimal_classifier(
     imported_qza: Path,
@@ -198,12 +229,12 @@ def get_optimal_classifier(
 ) -> Dict[str, list[Path]]:
     """Run each classifier and pick the best for every metric in *keys*.
 
-    Returns a mapping ``metric → classifier_path``.
+    Returns a mapping ``metric → [best, second_best]`` (Paths).
     Writes a report to ``<work>/optimal_classifiers.json`` so interrupted runs
     can resume without recomputing finished classifications.
     """
 
-    out = imported_qza.parent / ".work" / ".optimal_classifier"
+    out = _find_work_dir(imported_qza) / "optimal_classifier"
     out.mkdir(parents=True, exist_ok=True)
 
     # collect metrics --------------------------------------------------
@@ -214,7 +245,7 @@ def get_optimal_classifier(
         classification = out / f"{tag}_classification.qza"
 
         if classification.exists():
-            logger.info("%s exists, skipping classify‑sklearn.", classification)
+            logger.info("%s exists, skipping classify-sklearn.", classification)
         else:
             qiime_wrapper.classify_sklearn(
                 input_reads=imported_qza,
@@ -260,6 +291,3 @@ def get_optimal_classifier(
         )
 
     return top_leaders
-
-
-# -----------------------------------------------------------------------------

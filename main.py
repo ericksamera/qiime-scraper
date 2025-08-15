@@ -1,53 +1,102 @@
 # main.py
 
 import argparse
-from dataclasses import dataclass
+import json
 from pathlib import Path
 
 from modules import io_utils, iterators, logger, qiime_wrapper
 
-@dataclass
-class Args:
-    fastq_dir: Path
-    dry_run: bool = False
 
-def get_args() -> Args:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--fastq-dir",
-        type=Path,
-        required=True,
-        help="Directory containing .fastq.gz files.")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Print commands without executing")
-    
-    args = parser.parse_args()
-    return Args(**vars(args))
+def parse_args():
+    p = argparse.ArgumentParser(prog="pipeline")
+    sp = p.add_subparsers(dest="cmd", required=True)
 
-def main() -> None:
+    def add_common(sub):
+        sub.add_argument("--fastq-dir", type=Path, required=True, help="Project FASTQ dir")
+        sub.add_argument("--dry-run", action="store_true", help="Print commands without executing")
 
-    args = get_args()
+    # full run
+    run = sp.add_parser("run", help="Run full pipeline")
+    add_common(run)
+    run.add_argument("--classifiers-dir", type=Path, default=Path("/home/erick/qiime"))
 
-    log = logger.setup_logger()
+    # import-only
+    imp = sp.add_parser("import", help="Only import FASTQs to a QIIME artifact")
+    add_common(imp)
 
-    project_fastq_dir: Path = args.fastq_dir.resolve()
+    # trimming-only
+    trm = sp.add_parser("trim", help="Only search optimal trimming")
+    add_common(trm)
 
+    # classify-only
+    cls = sp.add_parser("classify", help="Only run classifier sweep")
+    add_common(cls)
+    cls.add_argument("--classifiers-dir", type=Path, default=Path("/home/erick/qiime"))
+
+    return p.parse_args()
+
+
+def _paths(project_fastq_dir: Path):
+    work = project_fastq_dir / ".work"
+    imported_qza = project_fastq_dir / "output.qza"
+    trim_dir = work / "optimal_trimming"
+    cls_dir = work / "optimal_classifier"
+    return work, imported_qza, trim_dir, cls_dir
+
+
+def cmd_import(project_fastq_dir: Path, dry_run: bool):
     io_utils.generate_manifest(project_fastq_dir)
-
     qiime_wrapper.import_data(
-        input_path=project_fastq_dir.joinpath('fastq.manifest'),
-        output_path=project_fastq_dir.joinpath('output.qza'),
-        dry_run=False
+        input_path=project_fastq_dir / "fastq.manifest",
+        output_path=project_fastq_dir / "output.qza",
+        dry_run=dry_run,
     )
 
-    f, r = iterators.get_optimal_trimming(imported_qza=project_fastq_dir.joinpath('output.qza'))
 
-    iterators.get_optimal_classifier(
-        imported_qza=project_fastq_dir / ".work" / ".optimal_trimming" / f"{f}-{r}_output_rep_seqs.qza",
-        classifiers_dir=Path('/home/erick/qiime'))
+def cmd_trim(imported_qza: Path):
+    return iterators.get_optimal_trimming(imported_qza=imported_qza)
+
+
+def _load_best_trim(trim_dir: Path) -> tuple[int, int]:
+    meta = json.loads((trim_dir / "optimal_trimming.json").read_text())
+    return int(meta["trunc_len_f"]), int(meta["trunc_len_r"])
+
+
+def cmd_classify(project_fastq_dir: Path, f: int, r: int, classifiers_dir: Path):
+    work, _, trim_dir, _ = _paths(project_fastq_dir)
+    rep_seqs = trim_dir / f"{f}-{r}_output_rep_seqs.qza"
+    return iterators.get_optimal_classifier(
+        imported_qza=rep_seqs,
+        classifiers_dir=classifiers_dir,
+    )
+
+
+def main():
+    args = parse_args()
+    logger.setup_logger()
+
+    project_fastq_dir = args.fastq_dir.resolve()
+    work, imported_qza, trim_dir, _ = _paths(project_fastq_dir)
+
+    if args.cmd == "import":
+        cmd_import(project_fastq_dir, args.dry_run)
+        return
+
+    if args.cmd == "trim":
+        cmd_trim(imported_qza)
+        return
+
+    if args.cmd == "classify":
+        f, r = _load_best_trim(trim_dir)
+        cmd_classify(project_fastq_dir, f, r, args.classifiers_dir)
+        return
+
+    if args.cmd == "run":
+        cmd_import(project_fastq_dir, args.dry_run)
+        f, r = cmd_trim(imported_qza)
+        cmd_classify(project_fastq_dir, f, r, args.classifiers_dir)
+        return
+
 
 if __name__ == "__main__":
     main()
-# ---
