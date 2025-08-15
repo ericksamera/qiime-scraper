@@ -5,8 +5,15 @@ from __future__ import annotations
 import csv
 import re
 import subprocess
+import logging
+import time
+
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Sequence, List
+
+from modules.logger import log_success
+
+logger = logging.getLogger("qiime_pipeline")
 
 # ---------------------------------------------------------------------
 # Manifest generation
@@ -16,7 +23,6 @@ from typing import Iterable, Sequence
 #   <root>_R1_001.fastq.gz  /  <root>_R2_001.fastq.gz
 # Also accepts: <root>_R1.fastq.gz / <root>_R2.fastq.gz
 _ILLUMINA_RE = re.compile(r"^(?P<root>.+)_R(?P<read>[12])(?:_[0-9]{3})?\.fastq\.gz$")
-
 
 def generate_manifest(project_fastq_dir: Path) -> Path:
     """
@@ -68,24 +74,24 @@ def generate_manifest(project_fastq_dir: Path) -> Path:
     return manifest_path
 
 
-# ---------------------------------------------------------------------
-# Subprocess helper (kept minimal + useful defaults)
-# ---------------------------------------------------------------------
-
 def run_command(
-    command: Sequence[str] | str,
-    *,
-    check: bool = True,
-    capture: bool = False,
-) -> str | subprocess.CompletedProcess:
+        command: List[str],
+        dry_run=False,
+        capture=False):
+
     """
-    Run a shell command. If `capture` is True, return stdout text; otherwise
-    return the CompletedProcess. Raises CalledProcessError on failure if `check` is True.
     """
-    result = subprocess.run(
-        command,
-        check=check,
-        capture_output=capture,
-        text=capture,
-    )
-    return result.stdout if capture else result
+
+    logger.info(f"Running: {' '.join(command)}")
+    if dry_run:
+        logger.debug("Dry-run mode: command not executed.")
+        return None
+    
+    start = time.time()
+    result = subprocess.run(command, check=True, capture_output=capture)
+    end = time.time()
+
+    duration = end - start
+    log_success(f"Command completed in {duration:.2f}s")
+
+    return result
