@@ -66,6 +66,8 @@ def generate_manifest(project_fastq_dir: Path, manifest_dir: Path) -> Path:
                 "forward-absolute-filepath",
                 "reverse-absolute-filepath",
             ],
+            delimiter="\t",
+            lineterminator="\n",
         )
         writer.writeheader()
         writer.writerows(rows)
