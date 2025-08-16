@@ -24,9 +24,9 @@ logger = logging.getLogger("qiime_pipeline")
 # Also accepts: <root>_R1.fastq.gz / <root>_R2.fastq.gz
 _ILLUMINA_RE = re.compile(r"^(?P<root>.+)_R(?P<read>[12])(?:_[0-9]{3})?\.fastq\.gz$")
 
-def generate_manifest(project_fastq_dir: Path) -> Path:
+def generate_manifest(project_fastq_dir: Path, manifest_dir: Path) -> Path:
     """
-    Create a PairedEndFastqManifestPhred33V2 CSV at <dir>/fastq.manifest with absolute paths.
+    Create a PairedEndFastqManifestPhred33V2 CSV at <manifest_dir>/fastq.manifest with absolute paths.
 
     Looks for *.fastq.gz directly under `project_fastq_dir`. If your FASTQs are nested
     in subfolders, change the loop to `project_fastq_dir.rglob("*.fastq.gz")`.
@@ -57,7 +57,7 @@ def generate_manifest(project_fastq_dir: Path) -> Path:
     if not rows:
         raise RuntimeError(f"No R1/R2 pairs found in {fastq_dir}")
 
-    manifest_path = fastq_dir / "fastq.manifest"
+    manifest_path = manifest_dir / "fastq.manifest"
     with manifest_path.open("w", newline="") as fh:
         writer = csv.DictWriter(
             fh,
@@ -66,11 +66,11 @@ def generate_manifest(project_fastq_dir: Path) -> Path:
                 "forward-absolute-filepath",
                 "reverse-absolute-filepath",
             ],
-            delimiter="\t"
         )
         writer.writeheader()
         writer.writerows(rows)
 
+    logger.info(f"Wrote manifest: {manifest_path}")
     return manifest_path
 
 

@@ -19,12 +19,12 @@ logger = logging.getLogger("qiime_pipeline")
 # ---------------------------------------------------------------------
 
 def _find_work_dir(p: Path) -> Path:
-    """Return the nearest ancestor named '.work', or create '<p.parent>/.work' if missing."""
+    """Return the nearest ancestor named 'work', or create '<p.parent>/work' if missing."""
     p = p.resolve()
     for parent in [p] + list(p.parents):
-        if parent.name == ".work":
+        if parent.name == "work":
             return parent
-    fallback = p.parent / ".work"
+    fallback = p.parent / "work"
     fallback.mkdir(parents=True, exist_ok=True)
     return fallback
 
