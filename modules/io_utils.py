@@ -75,25 +75,48 @@ def generate_manifest(project_fastq_dir: Path, manifest_dir: Path) -> Path:
     logger.info(f"Wrote manifest: {manifest_path}")
     return manifest_path
 
-
 def run_command(
         command: List[str],
-        dry_run=False,
-        capture=False):
-
+        dry_run: bool = False,
+        capture: bool = False,
+        env: dict | None = None):
     """
+    Run a shell command. If it fails, print QIIME's stdout/stderr so the user
+    sees the *actual* error message, not only a Python stack trace.
+    If 'capture' is False, QIIME's output streams live to the terminal.
     """
-
     logger.info(f"Running: {' '.join(command)}")
     if dry_run:
         logger.debug("Dry-run mode: command not executed.")
         return None
-    
-    start = time.time()
-    result = subprocess.run(command, check=True, capture_output=capture)
-    end = time.time()
 
+    start = time.time()
+    try:
+        # text=True -> stdout/stderr are decoded strings
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=capture,
+            text=True,
+            env=env
+        )
+    except subprocess.CalledProcessError as e:
+        # If we captured, print the captured output so users see the QIIME error.
+        if capture:
+            if e.stdout:
+                logger.error("QIIME stdout:\n%s", e.stdout.strip())
+            if e.stderr:
+                logger.error("QIIME stderr:\n%s", e.stderr.strip())
+        # If not captured, the user already saw the live QIIME output.
+        logger.error("Command failed (exit %s). See QIIME error above.", e.returncode)
+        # Exit with QIIME's code (cleanly) instead of a long Python traceback
+        raise SystemExit(e.returncode)
+
+    end = time.time()
     duration = end - start
     log_success(f"Command completed in {duration:.2f}s")
 
+    # When captured, you can optionally inspect result.stdout/result.stderr at DEBUG level
+    if capture and result.stdout:
+        logger.debug("QIIME stdout:\n%s", result.stdout.strip())
     return result

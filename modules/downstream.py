@@ -167,18 +167,25 @@ def choose_sampling_depth(
     return max(min_depth, freqs[k])
 
 
-def build_phylogeny(ana: Path) -> dict[str, Path]:
+def build_phylogeny(ana: Path, *, show_qiime: bool = False) -> dict[str, Path]:
     rooted = ana / "rooted-tree.qza"
     if rooted.exists():
         logger.info("Rooted tree already exists: %s", rooted)
         return {"rooted_tree": rooted}
 
+    req = ana / "rep-seqs.qza"
+    if not req.exists():
+        raise FileNotFoundError(
+            f"Missing {req}. Run 'python main.py stage --project-dir <dir> --metadata-file <tsv>' first."
+        )
+
     qiime_wrapper.phylogeny_align_to_tree_mafft_fasttree(
-        input_sequences=ana / "rep-seqs.qza",
+        input_sequences=req,
         output_alignment=ana / "aligned-rep-seqs.qza",
         output_masked_alignment=ana / "masked-aligned-rep-seqs.qza",
         output_tree=ana / "unrooted-tree.qza",
         output_rooted_tree=rooted,
+        show_qiime=show_qiime,
     )
     return {"rooted_tree": rooted}
 
@@ -190,7 +197,6 @@ def _metadata_columns(metadata_file: Path) -> set[str]:
     except Exception:
         return set()
 
-
 def run_core_diversity(
     ana: Path,
     metadata_file: Path,
@@ -198,68 +204,93 @@ def run_core_diversity(
     sampling_depth: Optional[int] = None,
     beta_cols: Iterable[str] = ("body-site", "subject"),
     time_column: Optional[str] = None,
+    include_alpha_tests: bool = True,
+    include_beta_tests: bool = True,
+    include_emperor: bool = True,
+    auto_build_tree: bool = True,
+    show_qiime: bool = False,
 ) -> dict[str, Path]:
-    """
-    Run core-metrics-phylogenetic + group significance tests + optional Emperor time plots.
-    """
+    """Run core-metrics-phylogenetic and optional steps with guardrails."""
+
+    # Required artifacts
+    table = ana / "table.qza"
+    tree  = ana / "rooted-tree.qza"
+
+    if not table.exists():
+        raise FileNotFoundError(
+            f"Missing {table}. Run 'python main.py stage --project-dir <dir> --metadata-file <tsv>' first."
+        )
+    if not tree.exists():
+        if auto_build_tree:
+            logger.info("No rooted-tree.qza found; building it now…")
+            build_phylogeny(ana, show_qiime=show_qiime)
+        else:
+            raise FileNotFoundError(
+                f"Missing {tree}. Run 'python main.py phylogeny --project-dir <dir>' first."
+            )
+
+    # Depth selection
     if sampling_depth is None:
         sampling_depth = choose_sampling_depth(ana)
+    logger.info("Using --p-sampling-depth=%d", sampling_depth)
 
     out_dir = ana / "core-metrics-phylo"
     qiime_wrapper.diversity_core_metrics_phylogenetic(
-        input_phylogeny=ana / "rooted-tree.qza",
-        input_table=ana / "table.qza",
+        input_phylogeny=tree,
+        input_table=table,
         sampling_depth=sampling_depth,
         metadata_file=metadata_file,
         output_dir=out_dir,
+        show_qiime=show_qiime,
     )
 
-    # Alpha group significance
-    qiime_wrapper.diversity_alpha_group_significance(
-        input_alpha_vector=out_dir / "faith_pd_vector.qza",
-        metadata_file=metadata_file,
-        output_visualization=ana / "faith-pd-group-significance.qzv",
-    )
-    qiime_wrapper.diversity_alpha_group_significance(
-        input_alpha_vector=out_dir / "evenness_vector.qza",
-        metadata_file=metadata_file,
-        output_visualization=ana / "evenness-group-significance.qzv",
-    )
-
-    # Beta group significance on unweighted UniFrac (adjust columns if present)
     cols_in_meta = _metadata_columns(metadata_file)
-    for col in beta_cols or []:
-        if col in cols_in_meta:
-            qiime_wrapper.diversity_beta_group_significance(
-                input_distance=out_dir / "unweighted_unifrac_distance_matrix.qza",
-                metadata_file=metadata_file,
-                metadata_column=col,
-                output_visualization=ana / f"unweighted-unifrac-{col}-group-significance.qzv",
-                pairwise=True,
-            )
-        else:
-            logger.info("Skipping beta-group-significance: column not in metadata: %s", col)
 
-    # Emperor time plots if *time_column* present
-    if time_column and time_column in cols_in_meta:
+    if include_alpha_tests:
+        qiime_wrapper.diversity_alpha_group_significance(
+            input_alpha_vector=out_dir / "faith_pd_vector.qza",
+            metadata_file=metadata_file,
+            output_visualization=ana / "faith-pd-group-significance.qzv",
+            show_qiime=show_qiime,
+        )
+        qiime_wrapper.diversity_alpha_group_significance(
+            input_alpha_vector=out_dir / "evenness_vector.qza",
+            metadata_file=metadata_file,
+            output_visualization=ana / "evenness-group-significance.qzv",
+            show_qiime=show_qiime,
+        )
+
+    if include_beta_tests:
+        for col in (beta_cols or []):
+            if col in cols_in_meta:
+                qiime_wrapper.diversity_beta_group_significance(
+                    input_distance=out_dir / "unweighted_unifrac_distance_matrix.qza",
+                    metadata_file=metadata_file,
+                    metadata_column=col,
+                    output_visualization=ana / f"unweighted-unifrac-{col}-group-significance.qzv",
+                    pairwise=True,
+                    show_qiime=show_qiime,
+                )
+            else:
+                logger.info("Skipping beta-group-significance: '%s' not in metadata.", col)
+
+    if include_emperor and time_column and time_column in cols_in_meta:
         qiime_wrapper.emperor_plot(
             input_pcoa=out_dir / "unweighted_unifrac_pcoa_results.qza",
             metadata_file=metadata_file,
             output_visualization=ana / f"unweighted-unifrac-emperor-{time_column}.qzv",
             custom_axes=time_column,
+            show_qiime=show_qiime,
         )
         qiime_wrapper.emperor_plot(
             input_pcoa=out_dir / "bray_curtis_pcoa_results.qza",
             metadata_file=metadata_file,
             output_visualization=ana / f"bray-curtis-emperor-{time_column}.qzv",
             custom_axes=time_column,
+            show_qiime=show_qiime,
         )
 
-    return {
-        "core_dir": out_dir,
-        "sampling_depth": Path(str(sampling_depth)),  # convenience for printing
-    }
-
+    return {"core_dir": out_dir, "sampling_depth": Path(str(sampling_depth))}
 
 def run_alpha_rarefaction(
     ana: Path,

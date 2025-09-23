@@ -76,6 +76,14 @@ def parse_args():
         help="Comma-separated metadata columns for beta-group-significance",
     )
     div.add_argument("--time-column", type=str, default=None)
+    div.add_argument("--skip-alpha-tests", action="store_true")
+    div.add_argument("--skip-beta-tests", action="store_true")
+    div.add_argument("--skip-emperor", action="store_true")
+    div.add_argument(
+        "--show-qiime",
+        action="store_true",
+        help="Stream QIIME stdout/stderr live (instead of capturing) for easier debugging",
+    )
 
     arf = sp.add_parser("alpha-rarefaction", help="Alpha rarefaction visualization")
     arf.add_argument("--project-dir", type=Path, required=True)
@@ -200,6 +208,11 @@ def main():
             sampling_depth=args.sampling_depth,
             beta_cols=[c.strip() for c in args.beta_cols.split(",") if c.strip()],
             time_column=args.time_column,
+            include_alpha_tests=not args.skip_alpha_tests,
+            include_beta_tests=not args.skip_beta_tests,
+            include_emperor=not args.skip_emperor,
+            auto_build_tree=True,                 # build rooted-tree if missing
+            show_qiime=args.show_qiime,          # stream logs if requested
         )
         return
 
