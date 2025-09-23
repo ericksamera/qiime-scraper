@@ -11,6 +11,8 @@ import zipfile
 from pathlib import Path
 from typing import Iterable, Optional
 
+import shutil, time
+
 from . import qiime_wrapper
 
 logger = logging.getLogger("qiime_pipeline")
@@ -197,6 +199,19 @@ def _metadata_columns(metadata_file: Path) -> set[str]:
     except Exception:
         return set()
 
+
+def _core_outputs_ready(out_dir: Path) -> bool:
+    need = [
+        "unweighted_unifrac_distance_matrix.qza",
+        "faith_pd_vector.qza",
+        "evenness_vector.qza",
+    ]
+    return all((out_dir / n).exists() for n in need)
+
+def _unique_dir(base: Path, name: str) -> Path:
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    return base / f"{name}-{ts}"
+
 def run_core_diversity(
     ana: Path,
     metadata_file: Path,
@@ -209,43 +224,62 @@ def run_core_diversity(
     include_emperor: bool = True,
     auto_build_tree: bool = True,
     show_qiime: bool = False,
+    if_exists: str = "skip",
 ) -> dict[str, Path]:
-    """Run core-metrics-phylogenetic and optional steps with guardrails."""
 
-    # Required artifacts
     table = ana / "table.qza"
     tree  = ana / "rooted-tree.qza"
-
     if not table.exists():
-        raise FileNotFoundError(
-            f"Missing {table}. Run 'python main.py stage --project-dir <dir> --metadata-file <tsv>' first."
-        )
+        raise FileNotFoundError(f"Missing {table}. Run 'python main.py stage ...' first.")
     if not tree.exists():
         if auto_build_tree:
             logger.info("No rooted-tree.qza found; building it now…")
             build_phylogeny(ana, show_qiime=show_qiime)
         else:
-            raise FileNotFoundError(
-                f"Missing {tree}. Run 'python main.py phylogeny --project-dir <dir>' first."
-            )
+            raise FileNotFoundError(f"Missing {tree}. Run 'python main.py phylogeny ...' first.")
 
-    # Depth selection
     if sampling_depth is None:
         sampling_depth = choose_sampling_depth(ana)
     logger.info("Using --p-sampling-depth=%d", sampling_depth)
 
     out_dir = ana / "core-metrics-phylo"
-    qiime_wrapper.diversity_core_metrics_phylogenetic(
-        input_phylogeny=tree,
-        input_table=table,
-        sampling_depth=sampling_depth,
-        metadata_file=metadata_file,
-        output_dir=out_dir,
-        show_qiime=show_qiime,
-    )
 
+    # Handle existing output directory
+    if out_dir.exists():
+        if if_exists == "skip":
+            if _core_outputs_ready(out_dir):
+                logger.info("Reusing existing core metrics at: %s", out_dir)
+            else:
+                raise SystemExit(
+                    "core-metrics-phylo exists but looks incomplete. "
+                    "Rerun with --if-exists overwrite or --if-exists new."
+                )
+        elif if_exists == "overwrite":
+            shutil.rmtree(out_dir)
+            logger.info("Deleted existing directory: %s", out_dir)
+        elif if_exists == "new":
+            out_dir = _unique_dir(ana, "core-metrics-phylo")
+            logger.info("Writing core metrics to new directory: %s", out_dir)
+        elif if_exists == "error":
+            raise SystemExit(
+                f"Output directory exists: {out_dir}. Use --if-exists overwrite|skip|new."
+            )
+        else:
+            raise ValueError("--if-exists must be one of: skip|overwrite|new|error")
+
+    # Run core metrics only if we didn't choose 'skip' with a ready dir
+    if not (out_dir.exists() and if_exists == "skip" and _core_outputs_ready(out_dir)):
+        qiime_wrapper.diversity_core_metrics_phylogenetic(
+            input_phylogeny=tree,
+            input_table=table,
+            sampling_depth=sampling_depth,
+            metadata_file=metadata_file,
+            output_dir=out_dir,
+            show_qiime=show_qiime,
+        )
+
+    # Continue with group tests / Emperor as before … (your existing code here)
     cols_in_meta = _metadata_columns(metadata_file)
-
     if include_alpha_tests:
         qiime_wrapper.diversity_alpha_group_significance(
             input_alpha_vector=out_dir / "faith_pd_vector.qza",

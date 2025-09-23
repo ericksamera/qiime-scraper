@@ -284,28 +284,19 @@ def diversity_core_metrics_phylogenetic(
     dry_run: bool = False,
     show_qiime: bool = False,
 ) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
     run_command(
         [
-            "qiime",
-            "diversity",
-            "core-metrics-phylogenetic",
-            "--i-phylogeny",
-            str(input_phylogeny),
-            "--i-table",
-            str(input_table),
-            "--p-sampling-depth",
-            str(sampling_depth),
-            "--m-metadata-file",
-            str(metadata_file),
-            "--output-dir",
-            str(output_dir),
+            "qiime", "diversity", "core-metrics-phylogenetic",
+            "--i-phylogeny", str(input_phylogeny),
+            "--i-table", str(input_table),
+            "--p-sampling-depth", str(sampling_depth),
+            "--m-metadata-file", str(metadata_file),
+            "--output-dir", str(output_dir),
         ],
         dry_run,
         capture=not show_qiime,
     )
     log_success("Core phylogenetic diversity completed.")
-
 
 def diversity_alpha_group_significance(
     input_alpha_vector: Path,

@@ -80,9 +80,15 @@ def parse_args():
     div.add_argument("--skip-beta-tests", action="store_true")
     div.add_argument("--skip-emperor", action="store_true")
     div.add_argument(
+        "--if-exists",
+        choices=["skip", "overwrite", "new", "error"],
+        default="skip",
+        help="What to do if analysis/core-metrics-phylo already exists (default: skip).",
+    )
+    div.add_argument(
         "--show-qiime",
         action="store_true",
-        help="Stream QIIME stdout/stderr live (instead of capturing) for easier debugging",
+        help="Stream QIIME logs live (otherwise they are captured and printed only on error).",
     )
 
     arf = sp.add_parser("alpha-rarefaction", help="Alpha rarefaction visualization")
@@ -208,11 +214,12 @@ def main():
             sampling_depth=args.sampling_depth,
             beta_cols=[c.strip() for c in args.beta_cols.split(",") if c.strip()],
             time_column=args.time_column,
-            include_alpha_tests=not args.skip_alpha_tests,
-            include_beta_tests=not args.skip_beta_tests,
-            include_emperor=not args.skip_emperor,
-            auto_build_tree=True,                 # build rooted-tree if missing
-            show_qiime=args.show_qiime,          # stream logs if requested
+            include_alpha_tests=not args.skip_alpha_tests if hasattr(args, "skip_alpha_tests") else True,
+            include_beta_tests=not args.skip_beta_tests if hasattr(args, "skip_beta_tests") else True,
+            include_emperor=not args.skip_emperor if hasattr(args, "skip_emperor") else True,
+            auto_build_tree=True,
+            show_qiime=args.show_qiime,
+            if_exists=args.if_exists,
         )
         return
 
