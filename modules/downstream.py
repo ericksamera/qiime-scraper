@@ -14,7 +14,7 @@ import time
 import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, TypedDict
 
 from . import qiime_wrapper
 
@@ -273,6 +273,10 @@ def _unique_dir(base: Path, name: str) -> Path:
     ts = time.strftime("%Y%m%d-%H%M%S")
     return base / f"{name}-{ts}"
 
+class CoreDiversityResult(TypedDict):
+    core_dir: Path
+    sampling_depth: int
+
 def run_core_diversity(
     ana: Path,
     metadata_file: Path,
@@ -287,7 +291,7 @@ def run_core_diversity(
     show_qiime: bool = False,
     if_exists: str = "skip",
     dry_run: bool = False,
-) -> dict[str, Path | int]:
+) -> CoreDiversityResult:
 
     table = ana / "table.qza"
     tree  = ana / "rooted-tree.qza"
@@ -296,7 +300,7 @@ def run_core_diversity(
     if not tree.exists():
         if auto_build_tree:
             logger.info("No rooted-tree.qza found; building it now…")
-            build_phylogeny(ana, show_qiime=show_qiime, dry_run=dry_run)
+            build_phylogeny(ana, show_qiime=show_qiime)
         else:
             raise FileNotFoundError(f"Missing {tree}. Run 'python main.py phylogeny ...' first.")
 
@@ -337,8 +341,8 @@ def run_core_diversity(
             sampling_depth=sampling_depth,
             metadata_file=metadata_file,
             output_dir=out_dir,
-            dry_run=dry_run,
             show_qiime=show_qiime,
+            dry_run=dry_run,
         )
 
     # Continue with group tests / Emperor
@@ -348,15 +352,15 @@ def run_core_diversity(
             input_alpha_vector=out_dir / "faith_pd_vector.qza",
             metadata_file=metadata_file,
             output_visualization=ana / "faith-pd-group-significance.qzv",
-            dry_run=dry_run,
             show_qiime=show_qiime,
+            dry_run=dry_run,
         )
         qiime_wrapper.diversity_alpha_group_significance(
             input_alpha_vector=out_dir / "evenness_vector.qza",
             metadata_file=metadata_file,
             output_visualization=ana / "evenness-group-significance.qzv",
-            dry_run=dry_run,
             show_qiime=show_qiime,
+            dry_run=dry_run,
         )
 
     if include_beta_tests:
@@ -368,8 +372,8 @@ def run_core_diversity(
                     metadata_column=col,
                     output_visualization=ana / f"unweighted-unifrac-{col}-group-significance.qzv",
                     pairwise=True,
-                    dry_run=dry_run,
                     show_qiime=show_qiime,
+                    dry_run=dry_run,
                 )
             else:
                 logger.info("Skipping beta-group-significance: '%s' not in metadata.", col)
@@ -380,19 +384,19 @@ def run_core_diversity(
             metadata_file=metadata_file,
             output_visualization=ana / f"unweighted-unifrac-emperor-{time_column}.qzv",
             custom_axes=time_column,
-            dry_run=dry_run,
             show_qiime=show_qiime,
+            dry_run=dry_run,
         )
         qiime_wrapper.emperor_plot(
             input_pcoa=out_dir / "bray_curtis_pcoa_results.qza",
             metadata_file=metadata_file,
             output_visualization=ana / f"bray-curtis-emperor-{time_column}.qzv",
             custom_axes=time_column,
-            dry_run=dry_run,
             show_qiime=show_qiime,
+            dry_run=dry_run,
         )
 
-    return {"core_dir": out_dir, "sampling_depth": sampling_depth}
+    return {"core_dir": out_dir, "sampling_depth": int(sampling_depth)}
 
 def run_alpha_rarefaction(
     ana: Path,
@@ -414,8 +418,8 @@ def run_alpha_rarefaction(
         max_depth=max_depth,
         metadata_file=metadata_file,
         output_visualization=out,
-        dry_run=dry_run,
         show_qiime=show_qiime,
+        dry_run=dry_run
     )
     return out
 
