@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import re
 import shutil
+import subprocess
+import sys
+import time
 import zipfile
+from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Iterable, Optional
-
-import shutil, time
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from . import qiime_wrapper
 
@@ -22,16 +25,15 @@ _SCRIPT_RE = re.compile(
     re.I | re.S,
 )
 
+# ------------------- basics -------------------
 
 def analysis_dir(project_dir: Path) -> Path:
     ana = project_dir / "analysis"
     ana.mkdir(parents=True, exist_ok=True)
     return ana
 
-
 def _read_json(p: Path) -> dict:
     return json.loads(p.read_text())
-
 
 def _stage(src: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -45,21 +47,120 @@ def _stage(src: Path, dest: Path) -> None:
         how = "copied"
     logger.info("%s -> %s", how.capitalize(), dest)
 
+# ------------------- provenance / RUN.json -------------------
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+def _try_qiime_info(dry_run: bool) -> str | None:
+    if dry_run:
+        return None
+    try:
+        out = subprocess.run(["qiime", "info"], check=True, capture_output=True, text=True)
+        return out.stdout.strip()
+    except Exception:
+        return None
+
+def write_run_provenance(ana: Path, command: str, payload: Mapping[str, object], *, dry_run: bool) -> None:
+    p = ana / "RUN.json"
+    rec = {
+        "command": command,
+        "started_at": _now_iso(),
+        "args": payload,
+        "env": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "cwd": str(Path.cwd()),
+            "qiime_info": _try_qiime_info(dry_run),
+        },
+    }
+    try:
+        winners = (ana / "WINNERS.env").read_text().splitlines()
+        rec["winners_env"] = dict(kv.split("=", 1) for kv in winners if "=" in kv)
+    except Exception:
+        rec["winners_env"] = {}
+    p.write_text(json.dumps(rec, indent=2) + "\n", encoding="utf-8")
+
+# ------------------- helpers: metrics & depths -------------------
+
+def _normalize_metric_key(k: str) -> str:
+    """
+    Normalize common variants to the JSON key used in reports.
+    Accepts 'pct_depth>=7' as a synonym for 'pct_depth≥7'.
+    """
+    if not k:
+        return k
+    s = k.strip().lower()
+    s = s.replace(" ", "")
+    s = s.replace(">=", "≥")
+    return s
 
 def _pick_classifier(cls_json: Path, preferred: str) -> str:
     data = _read_json(cls_json)
+    pref = _normalize_metric_key(preferred)
     # try preferred, then fallbacks
-    for k in (preferred, "median_conf", "mean_conf"):
+    for k in (pref, "pct_depth≥7", "median_conf", "mean_conf"):
         if k in data and data[k]:
             return data[k][0]["classifier"]  # e.g., "silva-138-99-515-806.qza"
     raise RuntimeError("No winners found in optimal_classifiers.json")
 
+def _extract_freqs_from_table_qzv(qzv: Path) -> list[int]:
+    if not qzv.exists():
+        return []
+    with zipfile.ZipFile(qzv) as z:
+        try:
+            html = z.read(
+                next(p for p in z.namelist() if Path(p).name == "sample-frequency-detail.html")
+            ).decode()
+        except (KeyError, StopIteration):
+            return []
+    m = _SCRIPT_RE.search(html)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+        vals = list(map(int, data["Frequency"].values()))
+        return sorted(vals)
+    except Exception:
+        return []
+
+def choose_sampling_depth(
+    ana: Path,
+    *,
+    retain_fraction: float = 0.90,
+    min_depth: int = 1000,
+) -> int:
+    """
+    Pick a depth that retains about *retain_fraction* of samples (default 90%).
+    Falls back to *min_depth* if extraction fails.
+    """
+    qzv = ana / "table-with-metadata.qzv"
+    if not qzv.exists():
+        qzv = ana / "table.qzv"
+    freqs = _extract_freqs_from_table_qzv(qzv)
+    if not freqs:
+        return min_depth
+    k = int((1.0 - retain_fraction) * len(freqs))
+    k = min(max(k, 0), len(freqs) - 1)
+    return max(min_depth, freqs[k])
+
+def choose_sampling_depth_from_qzv(qzv: Path, *, retain_fraction: float = 0.90, min_depth: int = 1000) -> int:
+    freqs = _extract_freqs_from_table_qzv(qzv)
+    if not freqs:
+        return min_depth
+    k = int((1.0 - retain_fraction) * len(freqs))
+    k = min(max(k, 0), len(freqs) - 1)
+    return max(min_depth, freqs[k])
+
+# ------------------- core downstream steps -------------------
 
 def stage_winners(
     project_dir: Path,
     *,
     preferred_metric: str = "pct_depth≥7",
     metadata_file: Optional[Path] = None,
+    show_qiime: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, Path]:
     """
     Link/copy winners into analysis/ with tutorial-style names:
@@ -109,10 +210,14 @@ def stage_winners(
             input_table=tbl_out,
             output=ana / "table-with-metadata.qzv",
             sample_metadata_file=metadata_file,
+            dry_run=dry_run,
+            show_qiime=show_qiime,
         )
     qiime_wrapper.feature_table_tabulate_seqs(
         input_data=rep_out,
         output=ana / "rep-seqs.qzv",
+        dry_run=dry_run,
+        show_qiime=show_qiime,
     )
 
     # Write a tiny winners record
@@ -126,50 +231,7 @@ def stage_winners(
         "analysis_dir": ana,
     }
 
-
-def _extract_freqs_from_table_qzv(qzv: Path) -> list[int]:
-    if not qzv.exists():
-        return []
-    with zipfile.ZipFile(qzv) as z:
-        try:
-            html = z.read(
-                next(p for p in z.namelist() if Path(p).name == "sample-frequency-detail.html")
-            ).decode()
-        except (KeyError, StopIteration):
-            return []
-    m = _SCRIPT_RE.search(html)
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(1))
-        vals = list(map(int, data["Frequency"].values()))
-        return sorted(vals)
-    except Exception:
-        return []
-
-
-def choose_sampling_depth(
-    ana: Path,
-    *,
-    retain_fraction: float = 0.90,
-    min_depth: int = 1000,
-) -> int:
-    """
-    Pick a depth that retains about *retain_fraction* of samples (default 90%).
-    Falls back to *min_depth* if extraction fails.
-    """
-    qzv = ana / "table-with-metadata.qzv"
-    if not qzv.exists():
-        qzv = ana / "table.qzv"
-    freqs = _extract_freqs_from_table_qzv(qzv)
-    if not freqs:
-        return min_depth
-    k = int((1.0 - retain_fraction) * len(freqs))
-    k = min(max(k, 0), len(freqs) - 1)
-    return max(min_depth, freqs[k])
-
-
-def build_phylogeny(ana: Path, *, show_qiime: bool = False) -> dict[str, Path]:
+def build_phylogeny(ana: Path, *, show_qiime: bool = False, dry_run: bool = False) -> dict[str, Path]:
     rooted = ana / "rooted-tree.qza"
     if rooted.exists():
         logger.info("Rooted tree already exists: %s", rooted)
@@ -187,10 +249,10 @@ def build_phylogeny(ana: Path, *, show_qiime: bool = False) -> dict[str, Path]:
         output_masked_alignment=ana / "masked-aligned-rep-seqs.qza",
         output_tree=ana / "unrooted-tree.qza",
         output_rooted_tree=rooted,
+        dry_run=dry_run,
         show_qiime=show_qiime,
     )
     return {"rooted_tree": rooted}
-
 
 def _metadata_columns(metadata_file: Path) -> set[str]:
     try:
@@ -198,7 +260,6 @@ def _metadata_columns(metadata_file: Path) -> set[str]:
         return set([h.strip() for h in header.split("\t")])
     except Exception:
         return set()
-
 
 def _core_outputs_ready(out_dir: Path) -> bool:
     need = [
@@ -225,7 +286,8 @@ def run_core_diversity(
     auto_build_tree: bool = True,
     show_qiime: bool = False,
     if_exists: str = "skip",
-) -> dict[str, Path]:
+    dry_run: bool = False,
+) -> dict[str, Path | int]:
 
     table = ana / "table.qza"
     tree  = ana / "rooted-tree.qza"
@@ -234,7 +296,7 @@ def run_core_diversity(
     if not tree.exists():
         if auto_build_tree:
             logger.info("No rooted-tree.qza found; building it now…")
-            build_phylogeny(ana, show_qiime=show_qiime)
+            build_phylogeny(ana, show_qiime=show_qiime, dry_run=dry_run)
         else:
             raise FileNotFoundError(f"Missing {tree}. Run 'python main.py phylogeny ...' first.")
 
@@ -275,22 +337,25 @@ def run_core_diversity(
             sampling_depth=sampling_depth,
             metadata_file=metadata_file,
             output_dir=out_dir,
+            dry_run=dry_run,
             show_qiime=show_qiime,
         )
 
-    # Continue with group tests / Emperor as before … (your existing code here)
+    # Continue with group tests / Emperor
     cols_in_meta = _metadata_columns(metadata_file)
     if include_alpha_tests:
         qiime_wrapper.diversity_alpha_group_significance(
             input_alpha_vector=out_dir / "faith_pd_vector.qza",
             metadata_file=metadata_file,
             output_visualization=ana / "faith-pd-group-significance.qzv",
+            dry_run=dry_run,
             show_qiime=show_qiime,
         )
         qiime_wrapper.diversity_alpha_group_significance(
             input_alpha_vector=out_dir / "evenness_vector.qza",
             metadata_file=metadata_file,
             output_visualization=ana / "evenness-group-significance.qzv",
+            dry_run=dry_run,
             show_qiime=show_qiime,
         )
 
@@ -303,6 +368,7 @@ def run_core_diversity(
                     metadata_column=col,
                     output_visualization=ana / f"unweighted-unifrac-{col}-group-significance.qzv",
                     pairwise=True,
+                    dry_run=dry_run,
                     show_qiime=show_qiime,
                 )
             else:
@@ -314,6 +380,7 @@ def run_core_diversity(
             metadata_file=metadata_file,
             output_visualization=ana / f"unweighted-unifrac-emperor-{time_column}.qzv",
             custom_axes=time_column,
+            dry_run=dry_run,
             show_qiime=show_qiime,
         )
         qiime_wrapper.emperor_plot(
@@ -321,10 +388,11 @@ def run_core_diversity(
             metadata_file=metadata_file,
             output_visualization=ana / f"bray-curtis-emperor-{time_column}.qzv",
             custom_axes=time_column,
+            dry_run=dry_run,
             show_qiime=show_qiime,
         )
 
-    return {"core_dir": out_dir, "sampling_depth": Path(str(sampling_depth))}
+    return {"core_dir": out_dir, "sampling_depth": sampling_depth}
 
 def run_alpha_rarefaction(
     ana: Path,
@@ -332,6 +400,8 @@ def run_alpha_rarefaction(
     *,
     max_depth: Optional[int] = None,
     sampling_depth_hint: Optional[int] = None,
+    show_qiime: bool = False,
+    dry_run: bool = False,
 ) -> Path:
     if max_depth is None:
         if sampling_depth_hint is None:
@@ -344,20 +414,22 @@ def run_alpha_rarefaction(
         max_depth=max_depth,
         metadata_file=metadata_file,
         output_visualization=out,
+        dry_run=dry_run,
+        show_qiime=show_qiime,
     )
     return out
 
-
-def run_taxa_barplots(ana: Path, metadata_file: Path) -> Path:
+def run_taxa_barplots(ana: Path, metadata_file: Path, *, show_qiime: bool = False, dry_run: bool = False) -> Path:
     out = ana / "taxa-bar-plots.qzv"
     qiime_wrapper.taxa_barplot(
         input_table=ana / "table.qza",
         input_taxonomy=ana / "taxonomy.qza",
         metadata_file=metadata_file,
         output_visualization=out,
+        dry_run=dry_run,
+        show_qiime=show_qiime,
     )
     return out
-
 
 def run_downstream(
     project_dir: Path,
@@ -368,19 +440,305 @@ def run_downstream(
     beta_cols: Iterable[str] = ("body-site", "subject"),
     time_column: Optional[str] = None,
     include_taxa_barplots: bool = True,
+    show_qiime: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, Path]:
     """Full flow: stage winners → tree → core metrics → rarefaction → (optional) taxa barplots."""
-    st = stage_winners(project_dir, preferred_metric=preferred_metric, metadata_file=metadata_file)
+    st = stage_winners(project_dir, preferred_metric=preferred_metric, metadata_file=metadata_file,
+                       show_qiime=show_qiime, dry_run=dry_run)
     ana = st["analysis_dir"]
-    build_phylogeny(ana)
+    build_phylogeny(ana, show_qiime=show_qiime, dry_run=dry_run)
     div = run_core_diversity(
         ana,
         metadata_file,
         sampling_depth=sampling_depth,
         beta_cols=beta_cols,
         time_column=time_column,
+        show_qiime=show_qiime,
+        dry_run=dry_run,
     )
-    run_alpha_rarefaction(ana, metadata_file, sampling_depth_hint=int(str(div["sampling_depth"])))
+    run_alpha_rarefaction(ana, metadata_file, sampling_depth_hint=div["sampling_depth"],
+                          show_qiime=show_qiime, dry_run=dry_run)
     if include_taxa_barplots:
-        run_taxa_barplots(ana, metadata_file)
+        run_taxa_barplots(ana, metadata_file, show_qiime=show_qiime, dry_run=dry_run)
     return {"analysis_dir": ana}
+
+# ------------------- NEW: Diversity sweep -------------------
+
+_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+def _slug(s: str) -> str:
+    return _SLUG_RE.sub("-", (s or "").strip()).strip("-._")
+
+def _parse_metadata_table(metadata_file: Path) -> tuple[List[str], Dict[str, str], List[Dict[str, str]]]:
+    """
+    Returns (headers, types_map, rows)
+    - headers: list of column names
+    - types_map: column -> 'categorical' | 'numeric' | ''
+    - rows: list of dicts for each sample row
+    """
+    lines = [ln.rstrip("\n") for ln in metadata_file.read_text(encoding="utf-8").splitlines() if ln.strip() != ""]
+    if not lines:
+        raise SystemExit(f"Empty metadata file: {metadata_file}")
+    headers = [h.strip() for h in lines[0].split("\t")]
+    types_map: Dict[str, str] = {h: "" for h in headers}
+    start_row = 1
+    if len(lines) > 1 and lines[1].startswith("#q2:types"):
+        type_vals = [v.strip() for v in lines[1].split("\t")]
+        for i, h in enumerate(headers):
+            if i < len(type_vals):
+                types_map[h] = type_vals[i].lower()
+        start_row = 2
+    rows: List[Dict[str, str]] = []
+    for ln in lines[start_row:]:
+        parts = ln.split("\t")
+        row = {}
+        for i, h in enumerate(headers):
+            row[h] = parts[i] if i < len(parts) else ""
+        rows.append(row)
+    return headers, types_map, rows
+
+def _categorical_columns(headers: Sequence[str], types_map: Mapping[str, str]) -> List[str]:
+    cats = []
+    for h in headers:
+        if h.lower() in {"sample-id", "sampleid", "#sampleid"}:
+            cats.append(h)  # keep for reference but we won't loop on it
+            continue
+        t = (types_map.get(h) or "").lower()
+        if t == "categorical" or (t == "" and h.lower() not in {"date", "time"}):
+            cats.append(h)
+    return cats
+
+def _value_counts(rows: Sequence[Mapping[str, str]], column: str) -> Counter:
+    c = Counter()
+    for r in rows:
+        v = (r.get(column) or "").strip()
+        if v != "":
+            c[v] += 1
+    return c
+
+def _require_columns(cols_in_meta: Set[str], needed: Iterable[str], *, context: str) -> None:
+    missing = [c for c in (needed or []) if c and c not in cols_in_meta]
+    if not missing:
+        return
+    advice = f"Available columns: {', '.join(sorted(cols_in_meta))}"
+    raise SystemExit(f"[metadata check] {context}: missing columns: {', '.join(missing)}.\n{advice}")
+
+def _sql_quote(val: str) -> str:
+    # quote single quotes for SQLite-style WHERE
+    return "'" + val.replace("'", "''") + "'"
+
+def run_diversity_sweep(
+    project_dir: Path,
+    metadata_file: Path,
+    *,
+    by: Iterable[str] | None,
+    within: Iterable[str] | None,
+    min_samples: int = 5,
+    retain_fraction: float = 0.90,
+    beta_cols: Iterable[str] | None = None,
+    time_column: Optional[str] = None,
+    if_exists: str = "skip",
+    show_qiime: bool = True,
+    dry_run: bool = False,
+) -> None:
+    """
+    Outer loop over 'by' columns, inner loop over 'within' columns.
+    If either is None, we use ALL categorical metadata columns.
+    Skips subsets with < min_samples rows (from metadata).
+    Depth per subset is chosen from that subset's table.qzv using retain_fraction.
+    """
+    proj = project_dir.resolve()
+    ana = analysis_dir(proj)
+
+    # Validate prerequisites
+    table = ana / "table.qza"
+    if not table.exists():
+        raise SystemExit(f"Missing {table}. Run 'python main.py stage --project-dir <dir> --metadata-file <tsv>' first.")
+
+    # Ensure root tree available
+    build_phylogeny(ana, show_qiime=show_qiime, dry_run=dry_run)
+
+    # Parse metadata and plan loops
+    headers, types_map, rows = _parse_metadata_table(metadata_file)
+    cols_in_meta = set(headers)
+    cats = [c for c in _categorical_columns(headers, types_map) if c.lower() not in {"sample-id", "sampleid", "#sampleid"}]
+
+    by_cols = list(by) if by else list(cats)
+    within_cols = list(within) if within else list(cats)
+
+    # Friendly validation (before long runs)
+    _require_columns(cols_in_meta, by_cols, context="--by")
+    _require_columns(cols_in_meta, within_cols, context="--within")
+    if time_column:
+        _require_columns(cols_in_meta, [time_column], context="--time-column")
+    if beta_cols:
+        _require_columns(cols_in_meta, beta_cols, context="--beta-cols")
+
+    # Provenance at the top level
+    write_run_provenance(
+        ana,
+        "diversity-sweep",
+        {
+            "project_dir": str(proj),
+            "metadata_file": str(metadata_file),
+            "by": by_cols,
+            "within": within_cols,
+            "min_samples": min_samples,
+            "retain_fraction": retain_fraction,
+            "beta_cols": list(beta_cols or []),
+            "time_column": time_column,
+            "if_exists": if_exists,
+            "show_qiime": show_qiime,
+            "dry_run": dry_run,
+        },
+        dry_run=dry_run,
+    )
+
+    # Precompute counts per column/value
+    value_counts: Dict[str, Counter] = {c: _value_counts(rows, c) for c in cats}
+
+    subsets_root = ana / "subsets"
+    subsets_root.mkdir(parents=True, exist_ok=True)
+    index_records: List[Dict[str, object]] = []
+
+    for outer_col in by_cols:
+        for outer_val, n_outer in sorted(value_counts.get(outer_col, Counter()).items()):
+            if n_outer < min_samples:
+                logger.info("[skip] %s=%s has only %d samples (< %d)", outer_col, outer_val, n_outer, min_samples)
+                continue
+
+            # subset expression for outer filter
+            outer_where = f'"{outer_col}" = {_sql_quote(outer_val)}'
+            outer_dir = subsets_root / _slug(f"{outer_col}") / _slug(f"{outer_val}")
+
+            for inner_col in within_cols:
+                if inner_col == outer_col:
+                    # Avoid redundant (outer==inner) second loop; user can request explicitly if desired
+                    continue
+
+                # Compute inner counts restricted to the outer subset
+                inner_counter: Counter = Counter()
+                for r in rows:
+                    if (r.get(outer_col) or "").strip() == outer_val:
+                        iv = (r.get(inner_col) or "").strip()
+                        if iv != "":
+                            inner_counter[iv] += 1
+
+                for inner_val, n_inner in sorted(inner_counter.items()):
+                    if n_inner < min_samples:
+                        logger.info("[skip] %s=%s AND %s=%s → %d samples (< %d)",
+                                    outer_col, outer_val, inner_col, inner_val, n_inner, min_samples)
+                        continue
+
+                    where = f'{outer_where} AND "{inner_col}" = {_sql_quote(inner_val)}'
+                    sub_dir = outer_dir / _slug(f"{inner_col}") / _slug(f"{inner_val}")
+                    sub_dir.mkdir(parents=True, exist_ok=True)
+
+                    # 1) Filter table
+                    sub_table = sub_dir / "table.qza"
+                    if sub_table.exists() and if_exists == "skip":
+                        logger.info("Reusing filtered table: %s", sub_table)
+                    else:
+                        if sub_table.exists() and if_exists == "overwrite":
+                            sub_table.unlink()
+                        elif sub_table.exists() and if_exists == "new":
+                            # Write to a new timestamped folder
+                            sub_dir = _unique_dir(outer_dir / _slug(f"{inner_col}") / _slug(f"{inner_val}"), "subset")
+                            sub_dir.mkdir(parents=True, exist_ok=True)
+                            sub_table = sub_dir / "table.qza"
+                        qiime_wrapper.feature_table_filter_samples(
+                            input_table=table,
+                            metadata_file=metadata_file,
+                            where=where,
+                            output_table=sub_table,
+                            dry_run=dry_run,
+                            show_qiime=show_qiime,
+                        )
+
+                    # 2) Summarize subset table + compute depth for this subset
+                    sub_qzv = sub_dir / "table.qzv"
+                    qiime_wrapper.feature_table_summarize(
+                        input_table=sub_table,
+                        output=sub_qzv,
+                        sample_metadata_file=metadata_file,
+                        dry_run=dry_run,
+                        show_qiime=show_qiime,
+                    )
+                    depth = choose_sampling_depth_from_qzv(sub_qzv, retain_fraction=retain_fraction)
+
+                    # 3) Run core metrics for this subset
+                    sub_core = sub_dir / "core-metrics-phylo"
+                    root_tree = ana / "rooted-tree.qza"
+                    if not root_tree.exists():
+                        build_phylogeny(ana, show_qiime=show_qiime, dry_run=dry_run)
+
+                    # Handle existing output directory for subset
+                    if sub_core.exists():
+                        if if_exists == "skip":
+                            logger.info("Reusing existing core metrics at: %s", sub_core)
+                        elif if_exists == "overwrite":
+                            shutil.rmtree(sub_core)
+                        elif if_exists == "new":
+                            sub_core = _unique_dir(sub_dir, "core-metrics-phylo")
+                            sub_core.mkdir(parents=True, exist_ok=True)
+                        elif if_exists == "error":
+                            raise SystemExit(f"Subset output exists: {sub_core}")
+                        else:
+                            raise ValueError("--if-exists must be one of: skip|overwrite|new|error")
+
+                    if not (sub_core.exists() and if_exists == "skip"):
+                        qiime_wrapper.diversity_core_metrics_phylogenetic(
+                            input_phylogeny=root_tree,
+                            input_table=sub_table,
+                            sampling_depth=depth,
+                            metadata_file=metadata_file,
+                            output_dir=sub_core,
+                            dry_run=dry_run,
+                            show_qiime=show_qiime,
+                        )
+
+                    # 4) Group tests: inner column + any extra beta columns
+                    test_cols = [inner_col] + list(beta_cols or [])
+                    for col in test_cols:
+                        if col in cols_in_meta:
+                            qiime_wrapper.diversity_beta_group_significance(
+                                input_distance=sub_core / "unweighted_unifrac_distance_matrix.qza",
+                                metadata_file=metadata_file,
+                                metadata_column=col,
+                                output_visualization=sub_dir / f"unweighted-unifrac-{_slug(col)}-group-significance.qzv",
+                                pairwise=True,
+                                dry_run=dry_run,
+                                show_qiime=show_qiime,
+                            )
+
+                    # 5) Emperor (if time column is present)
+                    if time_column and time_column in cols_in_meta:
+                        qiime_wrapper.emperor_plot(
+                            input_pcoa=sub_core / "unweighted_unifrac_pcoa_results.qza",
+                            metadata_file=metadata_file,
+                            output_visualization=sub_dir / f"unweighted-unifrac-emperor-{_slug(time_column)}.qzv",
+                            custom_axes=time_column,
+                            dry_run=dry_run,
+                            show_qiime=show_qiime,
+                        )
+
+                    # 6) Per-subset provenance
+                    subset_json = {
+                        "outer": {"column": outer_col, "value": outer_val, "n_samples": n_outer},
+                        "inner": {"column": inner_col, "value": inner_val, "n_samples": n_inner},
+                        "where": where,
+                        "sampling_depth": depth,
+                        "paths": {"dir": str(sub_dir), "table": str(sub_table), "core": str(sub_core)},
+                        "retain_fraction": retain_fraction,
+                        "min_samples": min_samples,
+                        "time_column": time_column,
+                        "beta_cols": test_cols,
+                        "timestamp": _now_iso(),
+                    }
+                    (sub_dir / "subset.json").write_text(json.dumps(subset_json, indent=2) + "\n", encoding="utf-8")
+                    index_records.append(subset_json)
+
+    # Write an index of all subset runs
+    (subsets_root / "index.json").write_text(json.dumps(index_records, indent=2) + "\n", encoding="utf-8")
+    logger.info("Diversity sweep completed across %d subsets.", len(index_records))

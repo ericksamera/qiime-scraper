@@ -71,6 +71,8 @@ def get_optimal_trimming(
     max_len: int = 250,
     min_len: int = 200,
     step: int = 25,
+    dry_run: bool = False,
+    show_qiime: bool = False,
 ) -> Tuple[int, int]:
     """Return the trunc-len pair (F, R) that maximises median sample frequency."""
 
@@ -93,8 +95,15 @@ def get_optimal_trimming(
                 output_table=table_qza,
                 output_rep_seqs=out / f"{tag}_output_rep_seqs.qza",
                 output_denoising_stats=out / f"{tag}_output_denoising_stats.qza",
+                dry_run=dry_run,
+                show_qiime=show_qiime,
             )
-            qiime_wrapper.feature_table_summarize(table_qza, table_qzv)
+            qiime_wrapper.feature_table_summarize(
+                input_table=table_qza,
+                output=table_qzv,
+                dry_run=dry_run,
+                show_qiime=show_qiime,
+            )
 
         return _extract_median(table_qzv)
 
@@ -226,6 +235,8 @@ def get_optimal_classifier(
     classifiers_dir: Path,
     *,
     keys: Sequence[str] = ("pct_depth≥7", "median_conf", "mean_conf"),
+    dry_run: bool = False,
+    show_qiime: bool = False,
 ) -> Dict[str, list[Path]]:
     """Run each classifier and pick the best for every metric in *keys*.
 
@@ -252,6 +263,8 @@ def get_optimal_classifier(
                 input_classifier=cls,
                 output_classification=classification,
                 reads_per_batch=5000,
+                dry_run=dry_run,
+                show_qiime=show_qiime,
             )
 
         metrics = _extract_classification_metrics(classification)

@@ -184,6 +184,32 @@ def feature_table_tabulate_seqs(
     )
 
 
+def feature_table_filter_samples(
+    input_table: Path,
+    metadata_file: Path,
+    where: str,
+    output_table: Path,
+    *,
+    dry_run: bool = False,
+    show_qiime: bool = False,
+) -> None:
+    """
+    Filter a table by a SQL-style WHERE clause against the metadata.
+    Example where: "treatment_group = 'Control' AND colony_source = 'BC'"
+    """
+    run_command(
+        [
+            "qiime", "feature-table", "filter-samples",
+            "--i-table", str(input_table),
+            "--m-metadata-file", str(metadata_file),
+            "--p-where", where,
+            "--o-filtered-table", str(output_table),
+        ],
+        dry_run,
+        capture=not show_qiime,
+    )
+
+
 def classify_sklearn(
     input_reads: Path,
     input_classifier: Path,
@@ -297,6 +323,7 @@ def diversity_core_metrics_phylogenetic(
         capture=not show_qiime,
     )
     log_success("Core phylogenetic diversity completed.")
+
 
 def diversity_alpha_group_significance(
     input_alpha_vector: Path,

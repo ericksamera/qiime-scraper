@@ -24,18 +24,9 @@ logger = logging.getLogger("qiime_pipeline")
 # Also accepts: <root>_R1.fastq.gz / <root>_R2.fastq.gz
 _ILLUMINA_RE = re.compile(r"^(?P<root>.+)_R(?P<read>[12])(?:_[0-9]{3})?\.fastq\.gz$")
 
-def generate_manifest(project_fastq_dir: Path, manifest_dir: Path) -> Path:
-    """
-    Create a PairedEndFastqManifestPhred33V2 CSV at <manifest_dir>/fastq.manifest with absolute paths.
-
-    Looks for *.fastq.gz directly under `project_fastq_dir`. If your FASTQs are nested
-    in subfolders, change the loop to `project_fastq_dir.rglob("*.fastq.gz")`.
-    """
-    fastq_dir = project_fastq_dir
-
-    # Collect R1/R2 pairs by parsing actual filenames (no string reconstruction).
+def _collect_pairs(paths: Iterable[Path]) -> list[dict[str, str]]:
     pairs: dict[str, dict[str, str]] = {}
-    for fq in fastq_dir.glob("*.fastq.gz"):
+    for fq in paths:
         m = _ILLUMINA_RE.match(fq.name)
         if not m:
             continue
@@ -53,9 +44,27 @@ def generate_manifest(project_fastq_dir: Path, manifest_dir: Path) -> Path:
                     "reverse-absolute-filepath": d["2"],
                 }
             )
+    return rows
+
+def generate_manifest(project_fastq_dir: Path, manifest_dir: Path) -> Path:
+    """
+    Create a PairedEndFastqManifestPhred33V2 CSV at <manifest_dir>/fastq.manifest with absolute paths.
+
+    First scans *.fastq.gz directly under `project_fastq_dir`.
+    If no valid R1/R2 pairs are found, it automatically retries recursively.
+    """
+    fastq_dir = project_fastq_dir
+
+    # Try flat directory
+    rows = _collect_pairs(fastq_dir.glob("*.fastq.gz"))
+
+    # Fallback: recursive search
+    if not rows:
+        logger.info("No R1/R2 pairs found at top level; retrying recursive search…")
+        rows = _collect_pairs(fastq_dir.rglob("*.fastq.gz"))
 
     if not rows:
-        raise RuntimeError(f"No R1/R2 pairs found in {fastq_dir}")
+        raise RuntimeError(f"No R1/R2 pairs found in {fastq_dir} (flat or recursive)")
 
     manifest_path = manifest_dir / "fastq.manifest"
     with manifest_path.open("w", newline="") as fh:
@@ -75,7 +84,7 @@ def generate_manifest(project_fastq_dir: Path, manifest_dir: Path) -> Path:
     logger.info(f"Wrote manifest: {manifest_path}")
     return manifest_path
 
-# modules/io_utils.py — replace run_command
+# modules/io_utils.py — run_command
 
 def run_command(
         command: List[str],
@@ -115,4 +124,3 @@ def run_command(
     if capture and result.stdout:
         logger.debug("QIIME stdout:\n%s", result.stdout.strip())
     return result
-
