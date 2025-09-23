@@ -2,7 +2,7 @@ import argparse
 import json
 from pathlib import Path
 
-from modules import io_utils, iterators, logger, qiime_wrapper
+from modules import io_utils, iterators, logger, qiime_wrapper, downstream
 
 
 def parse_args():
@@ -49,6 +49,54 @@ def parse_args():
     )
     cls.add_argument("--classifiers-dir", type=Path, default=Path("/home/erick/qiime"))
     cls.add_argument("--dry-run", action="store_true")
+
+    # ---------------- Downstream (Moving Pictures style) ----------------
+
+    stg = sp.add_parser("stage", help="Stage winners into analysis/ and build summaries")
+    stg.add_argument("--project-dir", type=Path, required=True)
+    stg.add_argument("--metadata-file", type=Path, required=False)
+    stg.add_argument(
+        "--preferred-metric",
+        type=str,
+        default="pct_depth≥7",
+        help="Which classifier metric to prefer (pct_depth≥7 | median_conf | mean_conf)",
+    )
+
+    phy = sp.add_parser("phylogeny", help="Build phylogeny (MAFFT→FastTree→root) in analysis/")
+    phy.add_argument("--project-dir", type=Path, required=True)
+
+    div = sp.add_parser("diversity", help="Run core phylogenetic diversity + tests + Emperor")
+    div.add_argument("--project-dir", type=Path, required=True)
+    div.add_argument("--metadata-file", type=Path, required=True)
+    div.add_argument("--sampling-depth", type=int, default=None)
+    div.add_argument(
+        "--beta-cols",
+        type=str,
+        default="body-site,subject",
+        help="Comma-separated metadata columns for beta-group-significance",
+    )
+    div.add_argument("--time-column", type=str, default=None)
+
+    arf = sp.add_parser("alpha-rarefaction", help="Alpha rarefaction visualization")
+    arf.add_argument("--project-dir", type=Path, required=True)
+    arf.add_argument("--metadata-file", type=Path, required=True)
+    arf.add_argument("--max-depth", type=int, default=None)
+
+    tx = sp.add_parser("taxonomy", help="Taxonomy bar plots")
+    tx.add_argument("--project-dir", type=Path, required=True)
+    tx.add_argument("--metadata-file", type=Path, required=True)
+
+    dwn = sp.add_parser(
+        "downstream",
+        help="Stage winners → phylogeny → core diversity → alpha-rarefaction → taxa barplots",
+    )
+    dwn.add_argument("--project-dir", type=Path, required=True)
+    dwn.add_argument("--metadata-file", type=Path, required=True)
+    dwn.add_argument("--preferred-metric", type=str, default="pct_depth≥7")
+    dwn.add_argument("--sampling-depth", type=int, default=None)
+    dwn.add_argument("--beta-cols", type=str, default="body-site,subject")
+    dwn.add_argument("--time-column", type=str, default=None)
+    dwn.add_argument("--no-taxa-barplots", action="store_true")
 
     return p.parse_args()
 
@@ -124,6 +172,60 @@ def main():
     if args.cmd == "classify":
         project_dir = args.project_dir.resolve()
         cmd_classify(project_dir, args.classifiers_dir, args.input_reads)
+        return
+
+    # ---------------- Downstream command handlers ----------------
+
+    if args.cmd == "stage":
+        proj = args.project_dir.resolve()
+        downstream.stage_winners(
+            proj,
+            preferred_metric=args.preferred_metric,
+            metadata_file=args.metadata_file,
+        )
+        return
+
+    if args.cmd == "phylogeny":
+        proj = args.project_dir.resolve()
+        ana = downstream.analysis_dir(proj)
+        downstream.build_phylogeny(ana)
+        return
+
+    if args.cmd == "diversity":
+        proj = args.project_dir.resolve()
+        ana = downstream.analysis_dir(proj)
+        downstream.run_core_diversity(
+            ana,
+            args.metadata_file,
+            sampling_depth=args.sampling_depth,
+            beta_cols=[c.strip() for c in args.beta_cols.split(",") if c.strip()],
+            time_column=args.time_column,
+        )
+        return
+
+    if args.cmd == "alpha-rarefaction":
+        proj = args.project_dir.resolve()
+        ana = downstream.analysis_dir(proj)
+        downstream.run_alpha_rarefaction(ana, args.metadata_file, max_depth=args.max_depth)
+        return
+
+    if args.cmd == "taxonomy":
+        proj = args.project_dir.resolve()
+        ana = downstream.analysis_dir(proj)
+        downstream.run_taxa_barplots(ana, args.metadata_file)
+        return
+
+    if args.cmd == "downstream":
+        proj = args.project_dir.resolve()
+        downstream.run_downstream(
+            proj,
+            args.metadata_file,
+            preferred_metric=args.preferred_metric,
+            sampling_depth=args.sampling_depth,
+            beta_cols=[c.strip() for c in args.beta_cols.split(",") if c.strip()],
+            time_column=args.time_column,
+            include_taxa_barplots=not args.no_taxa_barplots,
+        )
         return
 
 
