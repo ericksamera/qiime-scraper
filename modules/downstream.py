@@ -277,6 +277,7 @@ class CoreDiversityResult(TypedDict):
     core_dir: Path
     sampling_depth: int
 
+
 def run_core_diversity(
     ana: Path,
     metadata_file: Path,
@@ -292,7 +293,13 @@ def run_core_diversity(
     if_exists: str = "skip",
     dry_run: bool = False,
 ) -> CoreDiversityResult:
+    """
+    Run QIIME 2 core phylogenetic diversity and (optionally) group tests + Emperor.
 
+    Enhancements:
+      • Alpha tests now include: faith_pd, evenness, shannon, observed_features.
+      • Beta tests now run on: unweighted_unifrac, weighted_unifrac, bray_curtis, jaccard.
+    """
     table = ana / "table.qza"
     tree  = ana / "rooted-tree.qza"
     if not table.exists():
@@ -328,12 +335,12 @@ def run_core_diversity(
             logger.info("Writing core metrics to new directory: %s", out_dir)
         elif if_exists == "error":
             raise SystemExit(
-                f"Output directory exists: {out_dir}. Use --if-exists overwrite|skip|new."
+                f"Output directory exists: {out_dir}. Use --if-exists overwrite|skip|new|error."
             )
         else:
             raise ValueError("--if-exists must be one of: skip|overwrite|new|error")
 
-    # Run core metrics only if we didn't choose 'skip' with a ready dir
+    # Run core metrics only if we didn’t choose 'skip' with a ready dir
     if not (out_dir.exists() and if_exists == "skip" and _core_outputs_ready(out_dir)):
         qiime_wrapper.diversity_core_metrics_phylogenetic(
             input_phylogeny=tree,
@@ -347,38 +354,57 @@ def run_core_diversity(
 
     # Continue with group tests / Emperor
     cols_in_meta = _metadata_columns(metadata_file)
-    if include_alpha_tests:
-        qiime_wrapper.diversity_alpha_group_significance(
-            input_alpha_vector=out_dir / "faith_pd_vector.qza",
-            metadata_file=metadata_file,
-            output_visualization=ana / "faith-pd-group-significance.qzv",
-            show_qiime=show_qiime,
-            dry_run=dry_run,
-        )
-        qiime_wrapper.diversity_alpha_group_significance(
-            input_alpha_vector=out_dir / "evenness_vector.qza",
-            metadata_file=metadata_file,
-            output_visualization=ana / "evenness-group-significance.qzv",
-            show_qiime=show_qiime,
-            dry_run=dry_run,
-        )
 
-    if include_beta_tests:
-        for col in (beta_cols or []):
-            if col in cols_in_meta:
-                qiime_wrapper.diversity_beta_group_significance(
-                    input_distance=out_dir / "unweighted_unifrac_distance_matrix.qza",
+    # ---------- Alpha group significance (now for all core alpha metrics) ----------
+    if include_alpha_tests:
+        alpha_vectors = {
+            "faith-pd": out_dir / "faith_pd_vector.qza",
+            "evenness": out_dir / "evenness_vector.qza",
+            "shannon": out_dir / "shannon_vector.qza",
+            "observed-features": out_dir / "observed_features_vector.qza",
+        }
+        for key, vec in alpha_vectors.items():
+            if vec.exists():
+                qiime_wrapper.diversity_alpha_group_significance(
+                    input_alpha_vector=vec,
                     metadata_file=metadata_file,
-                    metadata_column=col,
-                    output_visualization=ana / f"unweighted-unifrac-{col}-group-significance.qzv",
-                    pairwise=True,
+                    output_visualization=ana / f"{key}-group-significance.qzv",
                     show_qiime=show_qiime,
                     dry_run=dry_run,
                 )
             else:
-                logger.info("Skipping beta-group-significance: '%s' not in metadata.", col)
+                logger.info("Skipping alpha-group-significance: missing %s", vec.name)
 
+    # ---------- Beta group significance (now for 4 distance matrices) ----------
+    if include_beta_tests:
+        # Distance matrix filenames produced by core-metrics-phylogenetic
+        beta_mats = {
+            "unweighted-unifrac": out_dir / "unweighted_unifrac_distance_matrix.qza",
+            "weighted-unifrac":   out_dir / "weighted_unifrac_distance_matrix.qza",
+            "bray-curtis":        out_dir / "bray_curtis_distance_matrix.qza",
+            "jaccard":            out_dir / "jaccard_distance_matrix.qza",
+        }
+        for dist_label, dist_path in beta_mats.items():
+            if not dist_path.exists():
+                logger.info("Skipping beta-group-significance: missing %s", dist_path.name)
+                continue
+            for col in (beta_cols or []):
+                if col in cols_in_meta:
+                    qiime_wrapper.diversity_beta_group_significance(
+                        input_distance=dist_path,
+                        metadata_file=metadata_file,
+                        metadata_column=col,
+                        output_visualization=ana / f"{dist_label}-{col}-group-significance.qzv",
+                        pairwise=True,
+                        show_qiime=show_qiime,
+                        dry_run=dry_run,
+                    )
+                else:
+                    logger.info("Skipping beta-group-significance for '%s': column not in metadata.", col)
+
+    # ---------- Emperor plots (leave selection as before; add quietly if desired) ----------
     if include_emperor and time_column and time_column in cols_in_meta:
+        # Keep the two most interpretable defaults; add more if you like.
         qiime_wrapper.emperor_plot(
             input_pcoa=out_dir / "unweighted_unifrac_pcoa_results.qza",
             metadata_file=metadata_file,
@@ -397,6 +423,7 @@ def run_core_diversity(
         )
 
     return {"core_dir": out_dir, "sampling_depth": int(sampling_depth)}
+
 
 def run_alpha_rarefaction(
     ana: Path,
@@ -548,24 +575,12 @@ def run_diversity_sweep(
     dry_run: bool = False,
 ) -> None:
     """
-    Run diversity across metadata-defined subsets.
+    Run diversity across metadata-defined subsets and produce per-subset stats/visualizations.
 
-    Modes
-    -----
-    • Nested (default): outer loop over `by` columns then inner loop over `within` columns.
-      For each (outer=value, inner=value2) subset, compute a per-subset sampling depth and run core metrics.
-      Group significance tests use [inner_col] + beta_cols.
-
-    • One level (`by_only=True`): loop *only* over `by` columns.
-      For each (by=value) subset, compute depth and run core metrics.
-      Group significance tests use only `beta_cols` that have ≥2 levels within the subset
-      (the outer column itself is skipped because it is constant in the subset).
-
-    Notes
-    -----
-    - If `by` (or `within`) is None, we use all categorical columns.
-    - Subsets with < min_samples (by metadata row counts) are skipped.
-    - Per-subset depth is chosen from that subset's table.qzv using `retain_fraction`.
+    • Alpha stats: faith_pd, evenness, shannon, observed_features (alpha-group-significance).
+    • Beta stats: unweighted_unifrac, weighted_unifrac, bray_curtis, jaccard (pairwise PERMANOVA).
+      - Only runs for metadata columns that have ≥2 levels inside each subset.
+    • Emperor: unweighted_unifrac + bray_curtis (if --time-column present).
     """
     proj = project_dir.resolve()
     ana = analysis_dir(proj)
@@ -589,7 +604,7 @@ def run_diversity_sweep(
     ]
 
     by_cols = list(by) if by else list(cats)
-    within_cols = list(within) if within else list(cats)
+    within_cols = list(within) if within else list(cats)  # ignored if by_only
 
     # Friendly validation
     _require_columns(cols_in_meta, by_cols, context="--by")
@@ -609,7 +624,7 @@ def run_diversity_sweep(
             "metadata_file": str(metadata_file),
             "by": by_cols,
             "within": None if by_only else within_cols,
-            "by_only": by_only,  # <-- NEW
+            "by_only": by_only,
             "min_samples": min_samples,
             "retain_fraction": retain_fraction,
             "beta_cols": list(beta_cols or []),
@@ -628,32 +643,132 @@ def run_diversity_sweep(
     subsets_root.mkdir(parents=True, exist_ok=True)
     index_records: List[Dict[str, object]] = []
 
-    # Helper: compute distinct levels of a column inside an outer subset
-    def _distinct_levels_in_subset(filter_col: str, filter_val: str, test_col: str) -> set[str]:
+    # Helpers -----------------------------------------------------------
+    def _levels_in_subset(filters: Dict[str, str], test_col: str) -> set[str]:
+        """Distinct levels of test_col among rows matching *filters*."""
         levels: set[str] = set()
         for r in rows:
-            if (r.get(filter_col) or "").strip() == filter_val:
+            if all((r.get(k) or "").strip() == v for k, v in filters.items()):
                 v = (r.get(test_col) or "").strip()
                 if v != "":
                     levels.add(v)
         return levels
+
+    def _maybe_out(path: Path) -> Optional[Path]:
+        """Return an output path to use (respecting if_exists), or None to skip."""
+        if path.exists():
+            if if_exists == "skip":
+                logger.info("Exists, skipping: %s", path)
+                return None
+            if if_exists == "overwrite":
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+            elif if_exists == "new":
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                path = path.with_name(f"{path.stem}-{ts}{path.suffix}")
+            elif if_exists == "error":
+                raise SystemExit(f"Output exists: {path}")
+            else:
+                raise ValueError("--if-exists must be one of: skip|overwrite|new|error")
+        return path
+
+    def _emit_alpha_visuals(sub_core: Path, sub_dir: Path) -> List[str]:
+        alpha_vectors = {
+            "faith-pd": sub_core / "faith_pd_vector.qza",
+            "evenness": sub_core / "evenness_vector.qza",
+            "shannon": sub_core / "shannon_vector.qza",
+            "observed-features": sub_core / "observed_features_vector.qza",
+        }
+        done: List[str] = []
+        for key, vec in alpha_vectors.items():
+            if not vec.exists():
+                continue
+            out_qzv = _maybe_out(sub_dir / f"{key}-group-significance.qzv")
+            if out_qzv:
+                qiime_wrapper.diversity_alpha_group_significance(
+                    input_alpha_vector=vec,
+                    metadata_file=metadata_file,
+                    output_visualization=out_qzv,
+                    show_qiime=show_qiime,
+                    dry_run=dry_run,
+                )
+                done.append(key)
+        return done
+
+    def _emit_beta_tests(sub_core: Path, sub_dir: Path, filters: Dict[str, str], candidate_cols: Iterable[str]) -> tuple[List[str], List[str]]:
+        beta_mats = {
+            "unweighted-unifrac": sub_core / "unweighted_unifrac_distance_matrix.qza",
+            "weighted-unifrac":   sub_core / "weighted_unifrac_distance_matrix.qza",
+            "bray-curtis":        sub_core / "bray_curtis_distance_matrix.qza",
+            "jaccard":            sub_core / "jaccard_distance_matrix.qza",
+        }
+        ran_cols: List[str] = []
+        ran_dists: set[str] = set()
+        for col in (candidate_cols or []):
+            if col not in cols_in_meta:
+                continue
+            # Only test if this column has >= 2 levels inside the subset
+            if len(_levels_in_subset(filters, col)) < 2:
+                logger.info("Skipping beta-group-significance: '%s' has < 2 levels in subset.", col)
+                continue
+            for dist_label, dist_path in beta_mats.items():
+                if not dist_path.exists():
+                    continue
+                out_qzv = _maybe_out(sub_dir / f"{dist_label}-{_slug(col)}-group-significance.qzv")
+                if out_qzv:
+                    qiime_wrapper.diversity_beta_group_significance(
+                        input_distance=dist_path,
+                        metadata_file=metadata_file,
+                        metadata_column=col,
+                        output_visualization=out_qzv,
+                        pairwise=True,
+                        dry_run=dry_run,
+                        show_qiime=show_qiime,
+                    )
+                    ran_dists.add(dist_label)
+            ran_cols.append(col)
+        return ran_cols, sorted(ran_dists)
+
+    def _emit_emperor(sub_core: Path, sub_dir: Path) -> List[str]:
+        if not (time_column and time_column in cols_in_meta):
+            return []
+        emitted: List[str] = []
+        plans = [
+            ("unweighted-unifrac", sub_core / "unweighted_unifrac_pcoa_results.qza"),
+            ("bray-curtis",        sub_core / "bray_curtis_pcoa_results.qza"),
+        ]
+        for label, pcoa in plans:
+            if not pcoa.exists():
+                continue
+            out_vis = _maybe_out(sub_dir / f"{label}-emperor-{_slug(time_column)}.qzv")
+            if out_vis:
+                qiime_wrapper.emperor_plot(
+                    input_pcoa=pcoa,
+                    metadata_file=metadata_file,
+                    output_visualization=out_vis,
+                    custom_axes=time_column,
+                    dry_run=dry_run,
+                    show_qiime=show_qiime,
+                )
+                emitted.append(label)
+        return emitted
 
     # --------------------- MODE: BY-ONLY (one level) ---------------------
     if by_only:
         for outer_col in by_cols:
             for outer_val, n_outer in sorted(value_counts.get(outer_col, Counter()).items()):
                 if n_outer < min_samples:
-                    logger.info(
-                        "[skip] %s=%s has only %d samples (< %d)",
-                        outer_col, outer_val, n_outer, min_samples
-                    )
+                    logger.info("[skip] %s=%s has only %d samples (< %d)", outer_col, outer_val, n_outer, min_samples)
                     continue
 
+                filters = {outer_col: outer_val}
                 outer_where = f'"{outer_col}" = {_sql_quote(outer_val)}'
                 sub_dir = subsets_root / _slug(f"{outer_col}") / _slug(f"{outer_val}")
                 sub_dir.mkdir(parents=True, exist_ok=True)
 
-                # 1) Filter table
+                # 1) Filter table (subset)
                 sub_table = sub_dir / "table.qza"
                 if sub_table.exists() and if_exists == "skip":
                     logger.info("Reusing filtered table: %s", sub_table)
@@ -714,48 +829,17 @@ def run_diversity_sweep(
                         show_qiime=show_qiime,
                     )
 
-                # 4) Group tests: only beta_cols that have ≥2 levels inside this subset
-                executed_tests: List[str] = []
-                for col in (beta_cols or []):
-                    if col not in cols_in_meta:
-                        continue
-                    if col == outer_col:
-                        # Outer column is constant by construction; skip testing it here.
-                        logger.info(
-                            "Skipping beta-group-significance on '%s' (constant within %s=%s).",
-                            col, outer_col, outer_val
-                        )
-                        continue
-                    levels = _distinct_levels_in_subset(outer_col, outer_val, col)
-                    if len(levels) < 2:
-                        logger.info(
-                            "Skipping beta-group-significance: '%s' has < 2 levels within %s=%s.",
-                            col, outer_col, outer_val
-                        )
-                        continue
-                    qiime_wrapper.diversity_beta_group_significance(
-                        input_distance=sub_core / "unweighted_unifrac_distance_matrix.qza",
-                        metadata_file=metadata_file,
-                        metadata_column=col,
-                        output_visualization=sub_dir / f"unweighted-unifrac-{_slug(col)}-group-significance.qzv",
-                        pairwise=True,
-                        dry_run=dry_run,
-                        show_qiime=show_qiime,
-                    )
-                    executed_tests.append(col)
+                # 4) Alpha stats (all four metrics)
+                alpha_done = _emit_alpha_visuals(sub_core, sub_dir)
 
-                # 5) Emperor (optional)
-                if time_column and time_column in cols_in_meta:
-                    qiime_wrapper.emperor_plot(
-                        input_pcoa=sub_core / "unweighted_unifrac_pcoa_results.qza",
-                        metadata_file=metadata_file,
-                        output_visualization=sub_dir / f"unweighted-unifrac-emperor-{_slug(time_column)}.qzv",
-                        custom_axes=time_column,
-                        dry_run=dry_run,
-                        show_qiime=show_qiime,
-                    )
+                # 5) Beta stats (4 distances) on columns that vary within the subset
+                candidate_cols = [c for c in (beta_cols or []) if c != outer_col]
+                ran_cols, ran_dists = _emit_beta_tests(sub_core, sub_dir, filters, candidate_cols)
 
-                # 6) Provenance
+                # 6) Emperor (optional)
+                emperor_done = _emit_emperor(sub_core, sub_dir)
+
+                # 7) Provenance
                 subset_json = {
                     "mode": "by-only",
                     "outer": {"column": outer_col, "value": outer_val, "n_samples": n_outer},
@@ -766,7 +850,10 @@ def run_diversity_sweep(
                     "retain_fraction": retain_fraction,
                     "min_samples": min_samples,
                     "time_column": time_column,
-                    "beta_cols": executed_tests,
+                    "alpha_metrics": alpha_done,
+                    "beta_cols": ran_cols,
+                    "beta_dists": ran_dists,
+                    "emperor": emperor_done,
                     "timestamp": _now_iso(),
                 }
                 (sub_dir / "subset.json").write_text(json.dumps(subset_json, indent=2) + "\n", encoding="utf-8")
@@ -776,7 +863,7 @@ def run_diversity_sweep(
         logger.info("Diversity sweep (by-only) completed across %d subsets.", len(index_records))
         return
 
-    # --------------------- MODE: NESTED (existing behavior) ---------------------
+    # --------------------- MODE: NESTED (outer by → inner within) ---------------------
     for outer_col in by_cols:
         for outer_val, n_outer in sorted(value_counts.get(outer_col, Counter()).items()):
             if n_outer < min_samples:
@@ -788,7 +875,6 @@ def run_diversity_sweep(
 
             for inner_col in within_cols:
                 if inner_col == outer_col:
-                    # Avoid redundant (outer==inner) second loop; user can request explicitly if desired
                     continue
 
                 # Compute inner counts restricted to the outer subset
@@ -807,6 +893,8 @@ def run_diversity_sweep(
                         )
                         continue
 
+                    # subset on outer + inner value
+                    filters = {outer_col: outer_val, inner_col: inner_val}
                     where = f'{outer_where} AND "{inner_col}" = {_sql_quote(inner_val)}'
                     sub_dir = outer_dir / _slug(f"{inner_col}") / _slug(f"{inner_val}")
                     sub_dir.mkdir(parents=True, exist_ok=True)
@@ -872,32 +960,17 @@ def run_diversity_sweep(
                             show_qiime=show_qiime,
                         )
 
-                    # 4) Group tests: inner column + any extra beta columns
-                    test_cols = [inner_col] + list(beta_cols or [])
-                    for col in test_cols:
-                        if col in cols_in_meta:
-                            qiime_wrapper.diversity_beta_group_significance(
-                                input_distance=sub_core / "unweighted_unifrac_distance_matrix.qza",
-                                metadata_file=metadata_file,
-                                metadata_column=col,
-                                output_visualization=sub_dir / f"unweighted-unifrac-{_slug(col)}-group-significance.qzv",
-                                pairwise=True,
-                                dry_run=dry_run,
-                                show_qiime=show_qiime,
-                            )
+                    # 4) Alpha stats (all four metrics)
+                    alpha_done = _emit_alpha_visuals(sub_core, sub_dir)
 
-                    # 5) Emperor (optional)
-                    if time_column and time_column in cols_in_meta:
-                        qiime_wrapper.emperor_plot(
-                            input_pcoa=sub_core / "unweighted_unifrac_pcoa_results.qza",
-                            metadata_file=metadata_file,
-                            output_visualization=sub_dir / f"unweighted-unifrac-emperor-{_slug(time_column)}.qzv",
-                            custom_axes=time_column,
-                            dry_run=dry_run,
-                            show_qiime=show_qiime,
-                        )
+                    # 5) Beta stats (4 distances) — NOTE: inner_col is constant here, so we only test extras that vary
+                    candidate_cols = [c for c in (beta_cols or []) if c not in {outer_col, inner_col}]
+                    ran_cols, ran_dists = _emit_beta_tests(sub_core, sub_dir, filters, candidate_cols)
 
-                    # 6) Per-subset provenance
+                    # 6) Emperor (optional)
+                    emperor_done = _emit_emperor(sub_core, sub_dir)
+
+                    # 7) Per-subset provenance
                     subset_json = {
                         "mode": "nested",
                         "outer": {"column": outer_col, "value": outer_val, "n_samples": n_outer},
@@ -908,7 +981,10 @@ def run_diversity_sweep(
                         "retain_fraction": retain_fraction,
                         "min_samples": min_samples,
                         "time_column": time_column,
-                        "beta_cols": test_cols,
+                        "alpha_metrics": alpha_done,
+                        "beta_cols": ran_cols,
+                        "beta_dists": ran_dists,
+                        "emperor": emperor_done,
                         "timestamp": _now_iso(),
                     }
                     (sub_dir / "subset.json").write_text(json.dumps(subset_json, indent=2) + "\n", encoding="utf-8")
