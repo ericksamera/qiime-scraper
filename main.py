@@ -5,9 +5,11 @@ from pathlib import Path
 
 from modules import io_utils, iterators, logger, qiime_wrapper, downstream
 
+__VERSION__="1.0.0"
+__AUTHOR__="Erick Samera (erick.samera@kpu.ca)"
 
 def parse_args():
-    p = argparse.ArgumentParser(prog="pipeline")
+    p = argparse.ArgumentParser(prog="pipeline", epilog=f"{__VERSION__} | {__AUTHOR__}")
 
     # ---------------- Global options (available on all subcommands) ---------------
     common = argparse.ArgumentParser(add_help=False)
