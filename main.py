@@ -121,22 +121,26 @@ def parse_args():
     dwn.add_argument("--time-column", type=str, default=None)
     dwn.add_argument("--no-taxa-barplots", action="store_true")
 
-    # ---------------- NEW: Diversity sweep (two nested loops) ----------------
-    sweep = sp.add_parser("diversity-sweep",
-                          parents=[common],
-                          help="Iterate core diversity over nested metadata subsets.")
+    # ---------------- Diversity sweep (nested or one-level) ----------------
+    sweep = sp.add_parser(
+        "diversity-sweep",
+        parents=[common],
+        help="Iterate core diversity over metadata subsets (nested by/within, or one-level by-only).",
+    )
     sweep.add_argument("--project-dir", type=Path, required=True)
     sweep.add_argument("--metadata-file", type=Path, required=True)
     sweep.add_argument("--by", type=str, default=None,
-                       help="Comma-separated outer loop columns. Default: all categorical columns.")
+                       help="Comma-separated outer loop columns (or all categorical if omitted).")
     sweep.add_argument("--within", type=str, default=None,
-                       help="Comma-separated inner loop columns. Default: all categorical columns.")
+                       help="Comma-separated inner loop columns (ignored if --by-only is set).")
+    sweep.add_argument("--by-only", action="store_true",
+                       help="Use a single-level sweep: only iterate values of --by (or all categorical if --by omitted).")
     sweep.add_argument("--min-samples", type=int, default=5,
                        help="Skip subsets with < N samples (default: 5).")
     sweep.add_argument("--retain-fraction", type=float, default=0.90,
                        help="Sampling depth retains ~this fraction of samples per subset (default: 0.90).")
     sweep.add_argument("--beta-cols", type=str, default="",
-                       help="Additional comma-separated columns for beta-group-significance (besides the inner loop column).")
+                       help="Additional comma-separated columns for beta-group-significance.")
     sweep.add_argument("--time-column", type=str, default=None,
                        help="Metadata column for Emperor custom axis, if present.")
     sweep.add_argument("--if-exists", choices=["skip", "overwrite", "new", "error"], default="skip",
@@ -190,7 +194,6 @@ def cmd_classify(project_dir: Path, classifiers_dir: Path, input_reads: Path | N
         dry_run=dry_run,
         show_qiime=show_qiime,
     )
-
 
 def main():
     args = parse_args()
@@ -305,6 +308,7 @@ def main():
             retain_fraction=args.retain_fraction,
             beta_cols=extra_beta,
             time_column=args.time_column,
+            by_only=args.by_only,  # <-- pass through
             if_exists=args.if_exists,
             show_qiime=args.show_qiime,
             dry_run=args.dry_run,

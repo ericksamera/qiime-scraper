@@ -542,15 +542,30 @@ def run_diversity_sweep(
     retain_fraction: float = 0.90,
     beta_cols: Iterable[str] | None = None,
     time_column: Optional[str] = None,
+    by_only: bool = False,
     if_exists: str = "skip",
     show_qiime: bool = True,
     dry_run: bool = False,
 ) -> None:
     """
-    Outer loop over 'by' columns, inner loop over 'within' columns.
-    If either is None, we use ALL categorical metadata columns.
-    Skips subsets with < min_samples rows (from metadata).
-    Depth per subset is chosen from that subset's table.qzv using retain_fraction.
+    Run diversity across metadata-defined subsets.
+
+    Modes
+    -----
+    • Nested (default): outer loop over `by` columns then inner loop over `within` columns.
+      For each (outer=value, inner=value2) subset, compute a per-subset sampling depth and run core metrics.
+      Group significance tests use [inner_col] + beta_cols.
+
+    • One level (`by_only=True`): loop *only* over `by` columns.
+      For each (by=value) subset, compute depth and run core metrics.
+      Group significance tests use only `beta_cols` that have ≥2 levels within the subset
+      (the outer column itself is skipped because it is constant in the subset).
+
+    Notes
+    -----
+    - If `by` (or `within`) is None, we use all categorical columns.
+    - Subsets with < min_samples (by metadata row counts) are skipped.
+    - Per-subset depth is chosen from that subset's table.qzv using `retain_fraction`.
     """
     proj = project_dir.resolve()
     ana = analysis_dir(proj)
@@ -558,28 +573,34 @@ def run_diversity_sweep(
     # Validate prerequisites
     table = ana / "table.qza"
     if not table.exists():
-        raise SystemExit(f"Missing {table}. Run 'python main.py stage --project-dir <dir> --metadata-file <tsv>' first.")
+        raise SystemExit(
+            f"Missing {table}. Run 'python main.py stage --project-dir <dir> --metadata-file <tsv>' first."
+        )
 
-    # Ensure root tree available
+    # Ensure rooted tree available
     build_phylogeny(ana, show_qiime=show_qiime, dry_run=dry_run)
 
     # Parse metadata and plan loops
     headers, types_map, rows = _parse_metadata_table(metadata_file)
     cols_in_meta = set(headers)
-    cats = [c for c in _categorical_columns(headers, types_map) if c.lower() not in {"sample-id", "sampleid", "#sampleid"}]
+    cats = [
+        c for c in _categorical_columns(headers, types_map)
+        if c.lower() not in {"sample-id", "sampleid", "#sampleid"}
+    ]
 
     by_cols = list(by) if by else list(cats)
     within_cols = list(within) if within else list(cats)
 
-    # Friendly validation (before long runs)
+    # Friendly validation
     _require_columns(cols_in_meta, by_cols, context="--by")
-    _require_columns(cols_in_meta, within_cols, context="--within")
+    if not by_only:
+        _require_columns(cols_in_meta, within_cols, context="--within")
     if time_column:
         _require_columns(cols_in_meta, [time_column], context="--time-column")
     if beta_cols:
         _require_columns(cols_in_meta, beta_cols, context="--beta-cols")
 
-    # Provenance at the top level
+    # Run-level provenance
     write_run_provenance(
         ana,
         "diversity-sweep",
@@ -587,7 +608,8 @@ def run_diversity_sweep(
             "project_dir": str(proj),
             "metadata_file": str(metadata_file),
             "by": by_cols,
-            "within": within_cols,
+            "within": None if by_only else within_cols,
+            "by_only": by_only,  # <-- NEW
             "min_samples": min_samples,
             "retain_fraction": retain_fraction,
             "beta_cols": list(beta_cols or []),
@@ -599,20 +621,168 @@ def run_diversity_sweep(
         dry_run=dry_run,
     )
 
-    # Precompute counts per column/value
+    # Precompute counts per column/value for outer loop(s)
     value_counts: Dict[str, Counter] = {c: _value_counts(rows, c) for c in cats}
 
     subsets_root = ana / "subsets"
     subsets_root.mkdir(parents=True, exist_ok=True)
     index_records: List[Dict[str, object]] = []
 
+    # Helper: compute distinct levels of a column inside an outer subset
+    def _distinct_levels_in_subset(filter_col: str, filter_val: str, test_col: str) -> set[str]:
+        levels: set[str] = set()
+        for r in rows:
+            if (r.get(filter_col) or "").strip() == filter_val:
+                v = (r.get(test_col) or "").strip()
+                if v != "":
+                    levels.add(v)
+        return levels
+
+    # --------------------- MODE: BY-ONLY (one level) ---------------------
+    if by_only:
+        for outer_col in by_cols:
+            for outer_val, n_outer in sorted(value_counts.get(outer_col, Counter()).items()):
+                if n_outer < min_samples:
+                    logger.info(
+                        "[skip] %s=%s has only %d samples (< %d)",
+                        outer_col, outer_val, n_outer, min_samples
+                    )
+                    continue
+
+                outer_where = f'"{outer_col}" = {_sql_quote(outer_val)}'
+                sub_dir = subsets_root / _slug(f"{outer_col}") / _slug(f"{outer_val}")
+                sub_dir.mkdir(parents=True, exist_ok=True)
+
+                # 1) Filter table
+                sub_table = sub_dir / "table.qza"
+                if sub_table.exists() and if_exists == "skip":
+                    logger.info("Reusing filtered table: %s", sub_table)
+                else:
+                    if sub_table.exists() and if_exists == "overwrite":
+                        sub_table.unlink()
+                    elif sub_table.exists() and if_exists == "new":
+                        sub_dir = _unique_dir(sub_dir.parent, "subset")
+                        sub_dir.mkdir(parents=True, exist_ok=True)
+                        sub_table = sub_dir / "table.qza"
+                    qiime_wrapper.feature_table_filter_samples(
+                        input_table=table,
+                        metadata_file=metadata_file,
+                        where=outer_where,
+                        output_table=sub_table,
+                        dry_run=dry_run,
+                        show_qiime=show_qiime,
+                    )
+
+                # 2) Summarize subset table + choose depth
+                sub_qzv = sub_dir / "table.qzv"
+                qiime_wrapper.feature_table_summarize(
+                    input_table=sub_table,
+                    output=sub_qzv,
+                    sample_metadata_file=metadata_file,
+                    dry_run=dry_run,
+                    show_qiime=show_qiime,
+                )
+                depth = choose_sampling_depth_from_qzv(sub_qzv, retain_fraction=retain_fraction)
+
+                # 3) Core metrics
+                sub_core = sub_dir / "core-metrics-phylo"
+                root_tree = ana / "rooted-tree.qza"
+                if not root_tree.exists():
+                    build_phylogeny(ana, show_qiime=show_qiime, dry_run=dry_run)
+
+                if sub_core.exists():
+                    if if_exists == "skip":
+                        logger.info("Reusing existing core metrics at: %s", sub_core)
+                    elif if_exists == "overwrite":
+                        shutil.rmtree(sub_core)
+                    elif if_exists == "new":
+                        sub_core = _unique_dir(sub_dir, "core-metrics-phylo")
+                        sub_core.mkdir(parents=True, exist_ok=True)
+                    elif if_exists == "error":
+                        raise SystemExit(f"Subset output exists: {sub_core}")
+                    else:
+                        raise ValueError("--if-exists must be one of: skip|overwrite|new|error")
+
+                if not (sub_core.exists() and if_exists == "skip"):
+                    qiime_wrapper.diversity_core_metrics_phylogenetic(
+                        input_phylogeny=root_tree,
+                        input_table=sub_table,
+                        sampling_depth=depth,
+                        metadata_file=metadata_file,
+                        output_dir=sub_core,
+                        dry_run=dry_run,
+                        show_qiime=show_qiime,
+                    )
+
+                # 4) Group tests: only beta_cols that have ≥2 levels inside this subset
+                executed_tests: List[str] = []
+                for col in (beta_cols or []):
+                    if col not in cols_in_meta:
+                        continue
+                    if col == outer_col:
+                        # Outer column is constant by construction; skip testing it here.
+                        logger.info(
+                            "Skipping beta-group-significance on '%s' (constant within %s=%s).",
+                            col, outer_col, outer_val
+                        )
+                        continue
+                    levels = _distinct_levels_in_subset(outer_col, outer_val, col)
+                    if len(levels) < 2:
+                        logger.info(
+                            "Skipping beta-group-significance: '%s' has < 2 levels within %s=%s.",
+                            col, outer_col, outer_val
+                        )
+                        continue
+                    qiime_wrapper.diversity_beta_group_significance(
+                        input_distance=sub_core / "unweighted_unifrac_distance_matrix.qza",
+                        metadata_file=metadata_file,
+                        metadata_column=col,
+                        output_visualization=sub_dir / f"unweighted-unifrac-{_slug(col)}-group-significance.qzv",
+                        pairwise=True,
+                        dry_run=dry_run,
+                        show_qiime=show_qiime,
+                    )
+                    executed_tests.append(col)
+
+                # 5) Emperor (optional)
+                if time_column and time_column in cols_in_meta:
+                    qiime_wrapper.emperor_plot(
+                        input_pcoa=sub_core / "unweighted_unifrac_pcoa_results.qza",
+                        metadata_file=metadata_file,
+                        output_visualization=sub_dir / f"unweighted-unifrac-emperor-{_slug(time_column)}.qzv",
+                        custom_axes=time_column,
+                        dry_run=dry_run,
+                        show_qiime=show_qiime,
+                    )
+
+                # 6) Provenance
+                subset_json = {
+                    "mode": "by-only",
+                    "outer": {"column": outer_col, "value": outer_val, "n_samples": n_outer},
+                    "inner": None,
+                    "where": outer_where,
+                    "sampling_depth": depth,
+                    "paths": {"dir": str(sub_dir), "table": str(sub_table), "core": str(sub_core)},
+                    "retain_fraction": retain_fraction,
+                    "min_samples": min_samples,
+                    "time_column": time_column,
+                    "beta_cols": executed_tests,
+                    "timestamp": _now_iso(),
+                }
+                (sub_dir / "subset.json").write_text(json.dumps(subset_json, indent=2) + "\n", encoding="utf-8")
+                index_records.append(subset_json)
+
+        (subsets_root / "index.json").write_text(json.dumps(index_records, indent=2) + "\n", encoding="utf-8")
+        logger.info("Diversity sweep (by-only) completed across %d subsets.", len(index_records))
+        return
+
+    # --------------------- MODE: NESTED (existing behavior) ---------------------
     for outer_col in by_cols:
         for outer_val, n_outer in sorted(value_counts.get(outer_col, Counter()).items()):
             if n_outer < min_samples:
                 logger.info("[skip] %s=%s has only %d samples (< %d)", outer_col, outer_val, n_outer, min_samples)
                 continue
 
-            # subset expression for outer filter
             outer_where = f'"{outer_col}" = {_sql_quote(outer_val)}'
             outer_dir = subsets_root / _slug(f"{outer_col}") / _slug(f"{outer_val}")
 
@@ -631,8 +801,10 @@ def run_diversity_sweep(
 
                 for inner_val, n_inner in sorted(inner_counter.items()):
                     if n_inner < min_samples:
-                        logger.info("[skip] %s=%s AND %s=%s → %d samples (< %d)",
-                                    outer_col, outer_val, inner_col, inner_val, n_inner, min_samples)
+                        logger.info(
+                            "[skip] %s=%s AND %s=%s → %d samples (< %d)",
+                            outer_col, outer_val, inner_col, inner_val, n_inner, min_samples
+                        )
                         continue
 
                     where = f'{outer_where} AND "{inner_col}" = {_sql_quote(inner_val)}'
@@ -647,7 +819,6 @@ def run_diversity_sweep(
                         if sub_table.exists() and if_exists == "overwrite":
                             sub_table.unlink()
                         elif sub_table.exists() and if_exists == "new":
-                            # Write to a new timestamped folder
                             sub_dir = _unique_dir(outer_dir / _slug(f"{inner_col}") / _slug(f"{inner_val}"), "subset")
                             sub_dir.mkdir(parents=True, exist_ok=True)
                             sub_table = sub_dir / "table.qza"
@@ -660,7 +831,7 @@ def run_diversity_sweep(
                             show_qiime=show_qiime,
                         )
 
-                    # 2) Summarize subset table + compute depth for this subset
+                    # 2) Summarize + choose depth
                     sub_qzv = sub_dir / "table.qzv"
                     qiime_wrapper.feature_table_summarize(
                         input_table=sub_table,
@@ -671,13 +842,12 @@ def run_diversity_sweep(
                     )
                     depth = choose_sampling_depth_from_qzv(sub_qzv, retain_fraction=retain_fraction)
 
-                    # 3) Run core metrics for this subset
+                    # 3) Core metrics
                     sub_core = sub_dir / "core-metrics-phylo"
                     root_tree = ana / "rooted-tree.qza"
                     if not root_tree.exists():
                         build_phylogeny(ana, show_qiime=show_qiime, dry_run=dry_run)
 
-                    # Handle existing output directory for subset
                     if sub_core.exists():
                         if if_exists == "skip":
                             logger.info("Reusing existing core metrics at: %s", sub_core)
@@ -716,7 +886,7 @@ def run_diversity_sweep(
                                 show_qiime=show_qiime,
                             )
 
-                    # 5) Emperor (if time column is present)
+                    # 5) Emperor (optional)
                     if time_column and time_column in cols_in_meta:
                         qiime_wrapper.emperor_plot(
                             input_pcoa=sub_core / "unweighted_unifrac_pcoa_results.qza",
@@ -729,6 +899,7 @@ def run_diversity_sweep(
 
                     # 6) Per-subset provenance
                     subset_json = {
+                        "mode": "nested",
                         "outer": {"column": outer_col, "value": outer_val, "n_samples": n_outer},
                         "inner": {"column": inner_col, "value": inner_val, "n_samples": n_inner},
                         "where": where,
@@ -745,4 +916,4 @@ def run_diversity_sweep(
 
     # Write an index of all subset runs
     (subsets_root / "index.json").write_text(json.dumps(index_records, indent=2) + "\n", encoding="utf-8")
-    logger.info("Diversity sweep completed across %d subsets.", len(index_records))
+    logger.info("Diversity sweep (nested) completed across %d subsets.", len(index_records))
