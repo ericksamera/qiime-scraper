@@ -7,6 +7,10 @@ from typing import Optional, Sequence, Union, Mapping
 from qs.utils.runner import run_command
 
 
+# ---------------------------
+# Imports & metadata helpers
+# ---------------------------
+
 def import_data(
     input_path: Path,
     output_path: Path,
@@ -42,6 +46,10 @@ def metadata_tabulate(
     run_command(cmd, dry_run=dry_run, capture=not show_stdout)
 
 
+# ---------------------------
+# Cutadapt
+# ---------------------------
+
 def cutadapt_trim_paired(
     *,
     input_seqs: Path,
@@ -70,6 +78,10 @@ def cutadapt_trim_paired(
         cmd.append("--p-no-indels")
     run_command(cmd, dry_run=dry_run, capture=not show_stdout)
 
+
+# ---------------------------
+# DADA2
+# ---------------------------
 
 def dada2_denoise_paired(
     *,
@@ -114,6 +126,10 @@ def dada2_denoise_paired(
         cmd += ["--p-n-reads-learn", str(n_reads_learn)]
     run_command(cmd, dry_run=dry_run, capture=not show_stdout)
 
+
+# ---------------------------
+# Feature-table utilities
+# ---------------------------
 
 def feature_table_summarize(
     *,
@@ -176,14 +192,18 @@ def merge_seqs(
     run_command(cmd, dry_run=dry_run, capture=not show_stdout)
 
 
+# ---------------------------
+# Classification (memory-safe defaults)
+# ---------------------------
+
 def classify_sklearn(
     *,
     input_reads: Path,
     input_classifier: Path,
     output_classification: Path,
-    reads_per_batch: Union[str, int] = 1000,     # safer default than 'auto'
-    n_jobs: int = 1,                              # safer default than 0 (all cores)
-    pre_dispatch: Optional[str] = None,           # default to '1*n_jobs'
+    reads_per_batch: Union[str, int] = 1000,  # safer default than 'auto'
+    n_jobs: int = 1,                           # safer default than 0 (all cores)
+    pre_dispatch: Optional[str] = None,        # default to '1*n_jobs'
     confidence: float = 0.7,
     read_orientation: str = "auto",
     dry_run: bool = False,
@@ -208,3 +228,49 @@ def classify_sklearn(
         "--p-read-orientation", str(read_orientation),
     ]
     run_command(cmd, dry_run=dry_run, capture=not show_stdout, env=dict(extra_env) if extra_env else None)
+
+
+# ---------------------------
+# Phylogeny & diversity
+# ---------------------------
+
+def phylogeny_align_to_tree_mafft_fasttree(
+    *,
+    input_sequences: Path,
+    output_alignment: Path,
+    output_masked_alignment: Path,
+    output_tree: Path,
+    output_rooted_tree: Path,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd: list[str] = [
+        "qiime", "phylogeny", "align-to-tree-mafft-fasttree",
+        "--i-sequences", str(input_sequences),
+        "--o-alignment", str(output_alignment),
+        "--o-masked-alignment", str(output_masked_alignment),
+        "--o-tree", str(output_tree),
+        "--o-rooted-tree", str(output_rooted_tree),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def diversity_core_metrics_phylogenetic(
+    *,
+    input_phylogeny: Path,
+    input_table: Path,
+    sampling_depth: int,
+    metadata_file: Path,
+    output_dir: Path,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd: list[str] = [
+        "qiime", "diversity", "core-metrics-phylogenetic",
+        "--i-phylogeny", str(input_phylogeny),
+        "--i-table", str(input_table),
+        "--p-sampling-depth", str(sampling_depth),
+        "--m-metadata-file", str(metadata_file),
+        "--output-dir", str(output_dir),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
