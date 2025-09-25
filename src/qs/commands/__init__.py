@@ -15,4 +15,5 @@ __all__ = [
     "denoise_runs",
     "classify_sweep",
     "auto_run",
+    "core_metrics",   # <-- add this
 ]

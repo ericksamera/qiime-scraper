@@ -13,7 +13,7 @@ from qs.commands import trim_primers as cmd_trim
 from qs.commands import denoise_runs as cmd_denoise
 from qs.commands import classify_sweep as cmd_cls
 from qs.commands import auto_run as cmd_auto
-
+from qs.commands import core_metrics as cmd_metrics
 
 def main() -> None:
     logger = setup_logger()
@@ -41,6 +41,7 @@ def main() -> None:
     cmd_denoise.setup_parser(subparsers, parent)
     cmd_cls.setup_parser(subparsers, parent)
     cmd_auto.setup_parser(subparsers, parent)
+    cmd_metrics.setup_parser(subparsers, parent)
 
     args = parser.parse_args()
     logger.debug("Parsed args: %r", args)
