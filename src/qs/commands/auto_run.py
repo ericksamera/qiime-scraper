@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Dict, List, Optional, Set
 
 from qs.utils.logger import get_logger
 from qs.utils.samples import discover_fastqs, paired_sample_ids
@@ -15,6 +15,7 @@ from qs.commands import denoise_runs as cmd_denoise
 from qs.commands import classify_sweep as cmd_cls
 from qs.qiime import commands as qiime
 from qs.analysis.depth import choose_sampling_depth
+from qs.utils.text import slugify
 
 LOG = get_logger("auto")
 
@@ -22,7 +23,11 @@ LOG = get_logger("auto")
 def setup_parser(subparsers, parent) -> None:
     p = subparsers.add_parser(
         "auto-run", parents=[parent],
-        help="End-to-end pipeline: (optional init) → import+cutadapt+DADA2 per run/group → merge → classify sweep → core metrics.",
+        help=(
+            "End-to-end pipeline with resume: "
+            "(optional init) → per-run/group import+cutadapt+DADA2(+auto trunc) → merge "
+            "→ classifier sweep → core metrics."
+        ),
     )
     # Init / inputs
     p.add_argument("--fastq-dir", type=Path, required=True, help="Top FASTQ directory; subfolders are runs.")
@@ -36,15 +41,34 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--keep-illumina-suffix", action="store_true", help="Keep _S#/_L### tokens in SampleIDs (default: strip).")
     p.add_argument("--id-regex", type=str, default=None, help="Optional regex to derive SampleID (named 'id' or group 1).")
 
+    # Stage skipping / resume / selection
+    p.add_argument("--skip-denoise", action="store_true",
+                   help="Skip import/cutadapt/DADA2/merge and reuse existing MERGED.json.")
+    p.add_argument("--skip-classify", action="store_true",
+                   help="Skip classifier sweep.")
+    p.add_argument("--skip-metrics", action="store_true",
+                   help="Skip phylogeny + core metrics.")
+    p.add_argument("--resume", action="store_true",
+                   help="Auto-skip stages with completed outputs (idempotent resume).")
+    p.add_argument("--groups", type=str, default=None,
+                   help="Comma-separated group keys or slugs to operate on (default: all).")
+
     # Denoise pipeline knobs (forwarded to denoise-runs)
-    p.add_argument("--split-by-primer-group", action="store_true", help="Per primer group within each run (recommended for mixed loci).")
-    p.add_argument("--discard-untrimmed", action="store_true", help="cutadapt: discard reads without primer.")
-    p.add_argument("--no-indels", action="store_true", help="cutadapt: exact matches only.")
+    p.add_argument("--split-by-primer-group", action="store_true",
+                   help="Per primer group within each run (recommended for mixed loci).")
+    p.add_argument("--discard-untrimmed", action="store_true",
+                   help="cutadapt: discard reads without primer.")
+    p.add_argument("--no-indels", action="store_true",
+                   help="cutadapt: exact matches only.")
     p.add_argument("--cores", type=int, default=0, help="Cores for cutadapt & DADA2.")
+
     # Auto truncation (forwarded)
-    p.add_argument("--auto-trunc", action="store_true", help="Auto optimize trunc-len-f/r per run/group.")
-    p.add_argument("--trunc-len-f", type=int, default=0, help="Override trunc-len-f (disables auto if both F/R set).")
-    p.add_argument("--trunc-len-r", type=int, default=0, help="Override trunc-len-r.")
+    p.add_argument("--auto-trunc", action="store_true",
+                   help="Auto optimize trunc-len-f/r per run/group.")
+    p.add_argument("--trunc-len-f", type=int, default=0,
+                   help="Override trunc-len-f (disables auto if both F/R set).")
+    p.add_argument("--trunc-len-r", type=int, default=0,
+                   help="Override trunc-len-r.")
     p.add_argument("--trunc-lower-frac", type=float, default=0.80)
     p.add_argument("--trunc-min-len", type=int, default=50)
     p.add_argument("--trunc-step", type=int, default=10)
@@ -60,13 +84,15 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--pooling-method", type=str, default="independent")
     p.add_argument("--chimera-method", type=str, default="consensus")
 
-    # Classifier sweep
-    p.add_argument("--classifiers-dir", type=Path, default=None, help="Directory of sklearn classifier .qza files (if omitted, skip sweep).")
+    # Classifier sweep (directory of sklearn classifiers)
+    p.add_argument("--classifiers-dir", type=Path, default=None,
+                   help="Directory of sklearn classifier .qza files (if omitted, skip sweep).")
 
     # Core metrics (phylogeny & diversity)
-    p.add_argument("--retain-fraction", type=float, default=0.90, help="Fraction of samples to retain when choosing depth.")
-    p.add_argument("--min-depth", type=int, default=1000, help="Minimum sampling depth.")
-    # (Optional) beta/alpha tests could be added later
+    p.add_argument("--retain-fraction", type=float, default=0.90,
+                   help="Fraction of samples to retain when choosing depth.")
+    p.add_argument("--min-depth", type=int, default=1000,
+                   help="Minimum sampling depth.")
 
     p.set_defaults(func=run)
 
@@ -98,7 +124,18 @@ def _init_and_exit(
     sys.exit(0)
 
 
-def _stage_three(rep_seqs: Path, table: Path, taxonomy: Optional[Path], meta_aug: Path, out_dir: Path, *, dry_run: bool, show_qiime: bool, retain_fraction: float, min_depth: int) -> None:
+def _stage_three(
+    rep_seqs: Path,
+    table: Path,
+    taxonomy: Optional[Path],
+    meta_aug: Path,
+    out_dir: Path,
+    *,
+    dry_run: bool,
+    show_qiime: bool,
+    retain_fraction: float,
+    min_depth: int
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     # Symlink or copy inputs
     for src, name in ((rep_seqs, "rep-seqs.qza"), (table, "table.qza")):
@@ -136,11 +173,19 @@ def _stage_three(rep_seqs: Path, table: Path, taxonomy: Optional[Path], meta_aug
     # choose depth (expects table.qzv nearby — created during merge; if not there, create it)
     table_qzv = out_dir / "table.qzv"
     if not table_qzv.exists():
-        qiime.feature_table_summarize(input_table=out_dir / "table.qza", output=table_qzv, sample_metadata_file=meta_aug,
-                                      dry_run=dry_run, show_stdout=show_qiime)
+        qiime.feature_table_summarize(
+            input_table=out_dir / "table.qza",
+            output=table_qzv,
+            sample_metadata_file=meta_aug,
+            dry_run=dry_run,
+            show_stdout=show_qiime,
+        )
     depth = choose_sampling_depth(table_qzv, retain_fraction=retain_fraction, min_depth=min_depth)
 
     core_dir = out_dir / "core-metrics-phylo"
+    if core_dir.exists():
+        LOG.info("Core metrics already present → %s (resume)", core_dir)
+        return
     qiime.diversity_core_metrics_phylogenetic(
         input_phylogeny=rooted,
         input_table=out_dir / "table.qza",
@@ -151,6 +196,51 @@ def _stage_three(rep_seqs: Path, table: Path, taxonomy: Optional[Path], meta_aug
         show_stdout=show_qiime,
     )
     LOG.info("Core metrics done (depth=%d) → %s", depth, core_dir)
+
+
+def _load_merged_index(project_dir: Path) -> Dict[str, dict]:
+    idx_path = project_dir / "MERGED.json"
+    if not idx_path.exists():
+        raise FileNotFoundError(f"Missing {idx_path}")
+    return json.loads(idx_path.read_text())
+
+
+def _select_groups(merged_index: Dict[str, dict], groups_arg: Optional[str]) -> Set[str]:
+    if not groups_arg:
+        return set(merged_index.keys())
+    want = {g.strip() for g in groups_arg.split(",") if g.strip()}
+    if not want:
+        return set(merged_index.keys())
+    # Accept either the group key (e.g., "all" or "F|R") or the slug folder name
+    # Build slug map
+    slug_to_key = {slugify(k if k else "all"): k for k in merged_index}
+    out: Set[str] = set()
+    for g in want:
+        if g in merged_index:
+            out.add(g)
+            continue
+        if g in slug_to_key:
+            out.add(slug_to_key[g])
+    if not out:
+        LOG.warning("None of the requested groups matched: %s ; available: %s", sorted(want), sorted(merged_index.keys()))
+        return set()
+    return out
+
+
+def _winner_if_present(group_dir: Path) -> Optional[str]:
+    report = group_dir / "classifiers" / "optimal_classifiers.json"
+    if not report.exists():
+        return None
+    try:
+        data = json.loads(report.read_text())
+        # try priorities in order
+        for key in ("pct_depth≥7", "median_conf", "mean_conf"):
+            winners = data.get("winners", {}).get(key, [])
+            if winners:
+                return str(winners[0]["classifier"])
+    except Exception:
+        return None
+    return None
 
 
 def run(args) -> None:
@@ -177,76 +267,118 @@ def run(args) -> None:
         print(f"error: metadata file not found: {meta_path} (use --init-metadata first)", file=sys.stderr)
         sys.exit(2)
 
-    # Step 1-2: run the per-run(/group) pipeline
-    ns = SimpleNamespace(
-        fastq_dir=fastq_dir,
-        project_dir=project_dir,
-        metadata_file=meta_path,
-        keep_illumina_suffix=args.keep_illumina_suffix,
-        id_regex=args.id_regex,
-        front_f_col="__f_primer",
-        front_r_col="__r_primer",
-        split_by_primer_group=args.split_by_primer_group,
-        cores=args.cores,
-        discard_untrimmed=args.discard_untrimmed,
-        no_indels=args.no_indels,
-        auto_trunc=args.auto_trunc,
-        trunc_len_f=args.trunc_len_f,
-        trunc_len_r=args.trunc_len_r,
-        trunc_lower_frac=args.trunc_lower_frac,
-        trunc_min_len=args.trunc_min_len,
-        trunc_step=args.trunc_step,
-        trunc_refine_step=args.trunc_refine_step,
-        trunc_quick_learn=args.trunc_quick_learn,
-        trim_left_f=args.trim_left_f,
-        trim_left_r=args.trim_left_r,
-        max_ee_f=args.max_ee_f,
-        max_ee_r=args.max_ee_r,
-        trunc_q=args.trunc_q,
-        min_overlap=args.min_overlap,
-        pooling_method=args.pooling_method,
-        chimera_method=args.chimera_method,
-        dry_run=getattr(args, "dry_run", False),
-        show_qiime=getattr(args, "show_qiime", True),
-    )
-    cmd_denoise.run(ns)
-
-    # Where are the merged outputs?
+    # Stage 1-2: denoise + merge unless skipped / already present
+    merged_index: Dict[str, dict]
     merged_index_path = project_dir / "MERGED.json"
-    if not merged_index_path.exists():
-        print("error: expected MERGED.json not found; denoise phase failed?", file=sys.stderr)
+
+    if args.resume and merged_index_path.exists():
+        LOG.info("Resume: MERGED.json found, skipping denoise/merge.")
+        args.skip_denoise = True
+
+    if not args.skip_denoise:
+        # Run per-run/group pipeline to produce merged outputs
+        ns = SimpleNamespace(
+            fastq_dir=fastq_dir,
+            project_dir=project_dir,
+            metadata_file=meta_path,
+            keep_illumina_suffix=args.keep_illumina_suffix,
+            id_regex=args.id_regex,
+            front_f_col="__f_primer",
+            front_r_col="__r_primer",
+            split_by_primer_group=args.split_by_primer_group,
+            cores=args.cores,
+            discard_untrimmed=args.discard_untrimmed,
+            no_indels=args.no_indels,
+            auto_trunc=args.auto_trunc,
+            trunc_len_f=args.trunc_len_f,
+            trunc_len_r=args.trunc_len_r,
+            trunc_lower_frac=args.trunc_lower_frac,
+            trunc_min_len=args.trunc_min_len,
+            trunc_step=args.trunc_step,
+            trunc_refine_step=args.trunc_refine_step,
+            trunc_quick_learn=args.trunc_quick_learn,
+            trim_left_f=args.trim_left_f,
+            trim_left_r=args.trim_left_r,
+            max_ee_f=args.max_ee_f,
+            max_ee_r=args.max_ee_r,
+            trunc_q=args.trunc_q,
+            min_overlap=args.min_overlap,
+            pooling_method=args.pooling_method,
+            chimera_method=args.chimera_method,
+            dry_run=getattr(args, "dry_run", False),
+            show_qiime=getattr(args, "show_qiime", True),
+        )
+        cmd_denoise.run(ns)
+
+    # Load (or require) merged index
+    try:
+        merged_index = _load_merged_index(project_dir)
+    except FileNotFoundError:
+        print("error: expected MERGED.json not found; denoise phase required or use --skip-denoise only when MERGED.json exists.",
+              file=sys.stderr)
         sys.exit(3)
-    merged_index = json.loads(merged_index_path.read_text())
 
-    # Step 3: classifier sweep (optional)
+    # Restrict to selected groups (if any)
+    selected = _select_groups(merged_index, args.groups)
+    if not selected:
+        print("error: no matching groups found to operate on.", file=sys.stderr)
+        sys.exit(4)
+
+    # Stage 3: classifier sweep (unless skipped / resume)
     winners: dict[str, dict] = {}
-    if args.classifiers_dir and Path(args.classifiers_dir).is_dir():
-        for group_key, rec in merged_index.items():
-            group_dir = Path(rec["dir"])
-            rep_seqs = group_dir / "rep-seqs.qza"
-            cls_out = group_dir / "classifiers"
-            res = cmd_cls.sweep_and_pick(
-                input_reads=rep_seqs,
-                classifiers_dir=Path(args.classifiers_dir),
-                out_dir=cls_out,
-                dry_run=getattr(args, "dry_run", False),
-                show_qiime=getattr(args, "show_qiime", True),
-            )
-            winners[group_key] = res
-            print(f"[ok] group={group_key} classifier winner={res['classifier_tag']} by {res['priority']}")
-    else:
-        LOG.info("No classifiers-dir provided; skipping sweep.")
+    classifiers_ok = (args.classifiers_dir and Path(args.classifiers_dir).is_dir())
 
-    # Step 4: stage + phylogeny + core metrics per group
+    for group_key in sorted(selected):
+        rec = merged_index[group_key]
+        group_dir = Path(rec["dir"])
+        rep_seqs = group_dir / "rep-seqs.qza"
+
+        if args.skip_classify or not classifiers_ok:
+            LOG.info("Skipping classification for group=%s", group_key)
+            continue
+
+        if args.resume:
+            prior = _winner_if_present(group_dir)
+            if prior:
+                LOG.info("Resume: winner already present for group=%s (%s); skipping sweep.", group_key, prior)
+                winners[group_key] = {"classifier_tag": prior, "priority": "resume"}
+                continue
+
+        cls_out = group_dir / "classifiers"
+        res = cmd_cls.sweep_and_pick(
+            input_reads=rep_seqs,
+            classifiers_dir=Path(args.classifiers_dir),  # type: ignore[arg-type]
+            out_dir=cls_out,
+            dry_run=getattr(args, "dry_run", False),
+            show_qiime=getattr(args, "show_qiime", True),
+        )
+        winners[group_key] = res
+        print(f"[ok] group={group_key} classifier winner={res['classifier_tag']} by {res['priority']}")
+
+    # Stage 4: phylogeny + core metrics (unless skipped / resume)
+    if args.skip_metrics:
+        LOG.info("Skipping core metrics per user request.")
+        print(f"[ok] auto-run (skipped metrics) → {project_dir}")
+        return
+
     meta_aug = project_dir / "metadata.augmented.tsv"
-    for group_key, rec in merged_index.items():
+    for group_key in sorted(selected):
+        rec = merged_index[group_key]
         group_dir = Path(rec["dir"])
         table = group_dir / "table.qza"
         rep_seqs = group_dir / "rep-seqs.qza"
+
+        # If classification was skipped or has no winner, taxonomy is optional.
         taxonomy = None
-        if winners.get(group_key):
+        if (group_key in winners) and winners[group_key].get("classifier_tag"):
             tag = winners[group_key]["classifier_tag"]
             taxonomy = group_dir / "classifiers" / f"{tag}_classification.qza"
+
+        # If resume and core metrics already exist, skip
+        if args.resume and (group_dir / "core-metrics-phylo").exists():
+            LOG.info("Resume: core-metrics present for group=%s; skipping.", group_key)
+            continue
+
         _stage_three(
             rep_seqs=rep_seqs,
             table=table,
