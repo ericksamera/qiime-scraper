@@ -28,6 +28,9 @@ def setup_parser(subparsers, parent) -> None:
 
 
 def _extract_metrics(tax_qza: Path) -> Dict[str, float]:
+    """
+    Read taxonomy.tsv inside taxonomy.qza and compute summary metrics.
+    """
     try:
         with zipfile.ZipFile(tax_qza) as z:
             tsv = z.read(next(p for p in z.namelist() if p.endswith("taxonomy.tsv"))).decode()
@@ -66,7 +69,7 @@ def _extract_metrics(tax_qza: Path) -> Dict[str, float]:
 
 def _parse_reads_per_batch(val: Union[str, int]) -> Union[str, int]:
     if isinstance(val, int):
-        return val
+        return max(1, val)
     s = str(val).strip().lower()
     if s == "auto":
         return "auto"
@@ -129,19 +132,34 @@ def sweep_and_pick(
 
     rank_keys = ("pct_depth≥7", "median_conf", "mean_conf")
     winners: Dict[str, List[Dict[str, object]]] = {}
+
     for key in rank_keys:
-        top = sorted(metrics_list, key=lambda kv: kv[1].get(key, 0.0), reverse=True)[:2]
-        winners[key] = [{"classifier": t, "value": kv[1].get(key)} for (t, kv) in top]
+        # sort by that metric (fall back to 0.0)
+        top: List[Tuple[str, Dict[str, float]]] = sorted(
+            metrics_list, key=lambda item: item[1].get(key, 0.0), reverse=True
+        )[:2]
+        # FIX: kv is the dict; do kv.get(key), not kv[1].get(...)
+        winners[key] = [{"classifier": tag, "value": metrics.get(key)} for (tag, metrics) in top]
 
     report = {"winners": winners, "all_metrics": {t: m for t, m in metrics_list}}
     (out_dir / "optimal_classifiers.json").write_text(json.dumps(report, indent=2) + "\n")
     LOG.info("Classifier sweep report → %s", out_dir / "optimal_classifiers.json")
 
+    # choose a single final winner by priority
     for key in rank_keys:
         pick = winners.get(key, [])
         if pick:
-            return {"priority": key, "classifier_tag": pick[0]["classifier"], "report_path": str(out_dir / "optimal_classifiers.json")}
-    return {"priority": "mean_conf", "classifier_tag": sorted(metrics_list, key=lambda kv: kv[1].get("mean_conf", 0.0), reverse=True)[0][0]}
+            return {
+                "priority": key,
+                "classifier_tag": pick[0]["classifier"],
+                "report_path": str(out_dir / "optimal_classifiers.json"),
+            }
+    # fallback
+    return {
+        "priority": "mean_conf",
+        "classifier_tag": sorted(metrics_list, key=lambda item: item[1].get("mean_conf", 0.0), reverse=True)[0][0],
+        "report_path": str(out_dir / "optimal_classifiers.json"),
+    }
 
 
 def run(args) -> None:
