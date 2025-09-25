@@ -88,7 +88,7 @@ def dada2_denoise_paired(
     pooling_method: str = "independent",
     chimera_method: str = "consensus",
     n_threads: int = 0,
-    n_reads_learn: Optional[int] = None,   # <— added
+    n_reads_learn: Optional[int] = None,
     dry_run: bool = False,
     show_stdout: bool = False,
 ) -> None:
@@ -173,4 +173,73 @@ def merge_seqs(
     for s in input_sequences:
         cmd += ["--i-data", str(s)]
     cmd += ["--o-merged-data", str(output_sequence)]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def classify_sklearn(
+    *,
+    input_reads: Path,
+    input_classifier: Path,
+    output_classification: Path,
+    reads_per_batch: str | int = "auto",
+    n_jobs: int = 0,
+    pre_dispatch: str = "2*n_jobs",
+    confidence: float = 0.7,
+    read_orientation: str = "auto",
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd: list[str] = [
+        "qiime", "feature-classifier", "classify-sklearn",
+        "--i-reads", str(input_reads),
+        "--i-classifier", str(input_classifier),
+        "--o-classification", str(output_classification),
+        "--p-reads-per-batch", str(reads_per_batch),
+        "--p-n-jobs", str(n_jobs),
+        "--p-pre-dispatch", str(pre_dispatch),
+        "--p-confidence", str(confidence),
+        "--p-read-orientation", str(read_orientation),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def phylogeny_align_to_tree_mafft_fasttree(
+    *,
+    input_sequences: Path,
+    output_alignment: Path,
+    output_masked_alignment: Path,
+    output_tree: Path,
+    output_rooted_tree: Path,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd: list[str] = [
+        "qiime", "phylogeny", "align-to-tree-mafft-fasttree",
+        "--i-sequences", str(input_sequences),
+        "--o-alignment", str(output_alignment),
+        "--o-masked-alignment", str(output_masked_alignment),
+        "--o-tree", str(output_tree),
+        "--o-rooted-tree", str(output_rooted_tree),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def diversity_core_metrics_phylogenetic(
+    *,
+    input_phylogeny: Path,
+    input_table: Path,
+    sampling_depth: int,
+    metadata_file: Path,
+    output_dir: Path,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd: list[str] = [
+        "qiime", "diversity", "core-metrics-phylogenetic",
+        "--i-phylogeny", str(input_phylogeny),
+        "--i-table", str(input_table),
+        "--p-sampling-depth", str(sampling_depth),
+        "--m-metadata-file", str(metadata_file),
+        "--output-dir", str(output_dir),
+    ]
     run_command(cmd, dry_run=dry_run, capture=not show_stdout)

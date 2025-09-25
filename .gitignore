@@ -197,3 +197,6 @@ cython_debug/
 *.fastq.gz
 *.qza
 *.qzv
+
+*.tsv
+metadata.tsv

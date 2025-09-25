@@ -5,7 +5,6 @@ Command package.
 Submodules are imported explicitly by qs.cli to avoid circular imports.
 Do NOT import submodules here.
 """
-
 __all__ = [
     "init",
     "import_reads",
@@ -14,4 +13,6 @@ __all__ = [
     "metadata_tabulate",
     "trim_primers",
     "denoise_runs",
+    "classify_sweep",
+    "auto_run",
 ]

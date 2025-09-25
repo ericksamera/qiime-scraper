@@ -13,7 +13,7 @@ from qs.utils.manifest import generate_manifest, read_manifest_sample_ids
 from qs.metadata.read import load_metadata_table
 from qs.metadata.augment import augment_metadata_with_runs_and_groups
 from qs.qiime import commands as qiime
-from qs.optimize.truncation import find_optimal_truncation  # <— NEW
+from qs.optimize.truncation import find_optimal_truncation
 
 LOG = get_logger("denoise")
 
@@ -52,13 +52,11 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--trunc-len-r", type=int, default=0, help="DADA2 --p-trunc-len-r (override auto if set).")
     p.add_argument("--auto-trunc", action="store_true",
                    help="Automatically choose trunc-len-f/r via coarse-to-fine optimization.")
-    p.add_argument("--trunc-lower-frac", type=float, default=0.80,
-                   help="Lower bound as fraction of read length (default 0.80).")
+    p.add_argument("--trunc-lower-frac", type=float, default=0.80, help="Lower bound as fraction of (post-trim) read length.")
     p.add_argument("--trunc-min-len", type=int, default=50, help="Absolute minimum trunc length bound.")
     p.add_argument("--trunc-step", type=int, default=10, help="Coarse step size in bp (default 10).")
     p.add_argument("--trunc-refine-step", type=int, default=5, help="Refine step size in bp (default 5).")
-    p.add_argument("--trunc-quick-learn", type=int, default=250000,
-                   help="n-reads-learn for optimization trials (speeds up search).")
+    p.add_argument("--trunc-quick-learn", type=int, default=250000, help="n-reads-learn for optimization trials.")
 
     # DADA2 other knobs
     p.add_argument("--trim-left-f", type=int, default=0, help="DADA2 --p-trim-left-f")
@@ -101,15 +99,21 @@ def _auto_or_fixed_trunc(
     sub_root: Path,
     input_for_dada2: Path,
     args,
+    fwd_list: List[str],
+    rev_list: List[str],
 ) -> Tuple[int, int, Dict[str, object]]:
     """
-    Decide trunc-len-f/r. If --auto-trunc, run optimizer; else use provided values.
+    Decide trunc-len-f/r. If --auto-trunc, run optimizer with primer-aware upper bounds.
     Returns (f, r, opt_result_dict_or_empty).
     """
+    # If user provided both trunc lens explicitly, respect them.
     if not args.auto_trunc and (args.trunc_len_f > 0 and args.trunc_len_r > 0):
         return args.trunc_len_f, args.trunc_len_r, {}
 
-    # Auto mode
+    # Auto mode — compute primer-length reductions (use shortest per side).
+    red_f = min((len(p) for p in fwd_list), default=0)
+    red_r = min((len(p) for p in rev_list), default=0)
+
     opt_dir = sub_root / "optimize_trunc"
     result = find_optimal_truncation(
         run_path=run_path,
@@ -131,6 +135,8 @@ def _auto_or_fixed_trunc(
         min_overlap=args.min_overlap,
         pooling_method=args.pooling_method,
         chimera_method=args.chimera_method,
+        length_reduction_f=red_f,
+        length_reduction_r=red_r,
     )
     best = result["best"]  # type: ignore[index]
     return int(best["trunc_len_f"]), int(best["trunc_len_r"]), result  # type: ignore[index]
@@ -148,7 +154,7 @@ def run(args) -> None:
         sys.exit(2)
     LOG.info("Detected %d run(s): %s", len(runs), ", ".join(runs.keys()))
 
-    # Per-run manifests to get normalized IDs
+    # Per-run manifests to map normalized IDs → run
     run_sid_map: Dict[str, str] = {}
     for run_id, run_path in runs.items():
         run_root = project_dir / "runs" / run_id
@@ -194,7 +200,6 @@ def run(args) -> None:
                 sub_root = run_root / gslug
                 _ensure_dir(sub_root)
 
-                # manifest limited to this group's SIDs
                 group_sids = [r.get("#SampleID") or r.get("sample-id") for r in run_rows
                               if f"{(r.get(args.front_f_col) or '').strip()}|{(r.get(args.front_r_col) or '').strip()}" == gkey]
                 group_sids = [s.lstrip("#") for s in group_sids if s]
@@ -232,12 +237,13 @@ def run(args) -> None:
                     )
                     input_for_dada2 = trimmed_qza
 
-                # >>> AUTO/FIXED TRUNCATION HERE <<<
-                trunc_f, trunc_r, opt_meta = _auto_or_fixed_trunc(
+                trunc_f, trunc_r, _ = _auto_or_fixed_trunc(
                     run_path=run_path,
                     sub_root=sub_root,
                     input_for_dada2=input_for_dada2,
                     args=args,
+                    fwd_list=fwd_list,
+                    rev_list=rev_list,
                 )
 
                 table_qza = sub_root / "table.qza"
@@ -300,12 +306,13 @@ def run(args) -> None:
                 )
                 input_for_dada2 = trimmed_qza
 
-            # >>> AUTO/FIXED TRUNCATION HERE <<<
-            trunc_f, trunc_r, opt_meta = _auto_or_fixed_trunc(
+            trunc_f, trunc_r, _ = _auto_or_fixed_trunc(
                 run_path=run_path,
                 sub_root=run_root,
                 input_for_dada2=input_for_dada2,
                 args=args,
+                fwd_list=fwd_list,
+                rev_list=rev_list,
             )
 
             table_qza = run_root / "table.qza"
@@ -334,7 +341,7 @@ def run(args) -> None:
             per_group_tables.setdefault("all", []).append(table_qza)
             per_group_seqs.setdefault("all", []).append(seqs_qza)
 
-    # Merge and summarize (unchanged)
+    # Merge across runs (per group) and summarize
     merged_index = {}
     for gkey, tables in per_group_tables.items():
         seqs = per_group_seqs.get(gkey, [])
