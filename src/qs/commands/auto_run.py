@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -136,32 +137,98 @@ def _stage_three(
     retain_fraction: float,
     min_depth: int
 ) -> None:
+    """
+    Prepare analysis in out_dir and run phylogeny + core metrics.
+    Robust to files already being in-place; avoids self-referential symlinks.
+    If rep-seqs.qza is missing/broken, auto-repair from per-run outputs.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Symlink or copy inputs
-    for src, name in ((rep_seqs, "rep-seqs.qza"), (table, "table.qza")):
-        dst = out_dir / name
-        if dst.exists() or dst.is_symlink():
-            dst.unlink()
+
+    def _is_broken_symlink(p: Path) -> bool:
+        return p.is_symlink() and not p.exists()
+
+    def _stage_artifact(src: Path, dest: Path) -> None:
+        # If src == dest (same path), do nothing
+        if str(src) == str(dest):
+            LOG.debug("Artifact already in place: %s", dest)
+            return
+        # If dest exists and already points to same file, keep
+        if dest.exists() or dest.is_symlink():
+            try:
+                if dest.resolve() == src.resolve():
+                    LOG.debug("Reusing existing artifact: %s", dest)
+                    return
+            except Exception:
+                pass
+            # otherwise remove old/broken
+            try:
+                dest.unlink()
+            except FileNotFoundError:
+                pass
+        # Prefer hardlink; fallback to symlink; fallback to copy
         try:
-            dst.symlink_to(src)
+            os.link(src, dest)
+            LOG.debug("Hardlinked %s → %s", src, dest)
+            return
         except Exception:
+            try:
+                dest.symlink_to(src)
+                LOG.debug("Symlinked %s → %s", src, dest)
+                return
+            except Exception:
+                import shutil
+                shutil.copy2(src, dest)
+                LOG.debug("Copied %s → %s", src, dest)
+
+    # --- auto-repair broken/missing rep-seqs.qza ---
+    # If the group rep-seqs is missing (or a broken self-symlink), rebuild from per-run rep-seqs.
+    if (not rep_seqs.exists()) or _is_broken_symlink(rep_seqs):
+        group_slug = out_dir.name
+        project_dir = out_dir.parent.parent  # .../project/groups/<slug> → project/
+        runs_root = project_dir / "runs"
+        per_run_rep = sorted(runs_root.glob(f"*/{group_slug}/rep-seqs.qza"))
+        if not per_run_rep:
+            raise FileNotFoundError(f"rep-seqs.qza missing and no per-run rep-seqs found under {runs_root}/ */{group_slug}/")
+        if len(per_run_rep) == 1:
+            # single run — just copy it back
             import shutil
-            shutil.copy2(src, dst)
+            rep_seqs.parent.mkdir(parents=True, exist_ok=True)
+            if rep_seqs.exists() or rep_seqs.is_symlink():
+                try:
+                    rep_seqs.unlink()
+                except Exception:
+                    pass
+            shutil.copy2(per_run_rep[0], rep_seqs)
+            LOG.warning("Repaired rep-seqs.qza by copying from %s", per_run_rep[0])
+        else:
+            # multiple runs — merge
+            tmp_merged = out_dir / "_rep-seqs.repaired.qza"
+            qiime.merge_seqs(per_run_rep, tmp_merged, dry_run=dry_run, show_stdout=show_qiime)
+            if rep_seqs.exists() or rep_seqs.is_symlink():
+                try:
+                    rep_seqs.unlink()
+                except Exception:
+                    pass
+            os.replace(tmp_merged, rep_seqs)
+            LOG.warning("Repaired rep-seqs.qza by merging %d per-run files", len(per_run_rep))
+
+    # Stage artifacts into out_dir only if they are elsewhere
+    rep_dest = out_dir / "rep-seqs.qza"
+    tbl_dest = out_dir / "table.qza"
+    if rep_seqs.exists() and not _is_broken_symlink(rep_seqs):
+        _stage_artifact(rep_seqs, rep_dest)
+    if table.exists():
+        _stage_artifact(table, tbl_dest)
     if taxonomy:
-        dst = out_dir / "taxonomy.qza"
-        if dst.exists() or dst.is_symlink():
-            dst.unlink()
-        try:
-            dst.symlink_to(taxonomy)
-        except Exception:
-            import shutil
-            shutil.copy2(taxonomy, dst)
+        tax_dest = out_dir / "taxonomy.qza"
+        if taxonomy.exists():
+            _stage_artifact(taxonomy, tax_dest)
 
     # Build phylogeny
     rooted = out_dir / "rooted-tree.qza"
     if not rooted.exists():
         qiime.phylogeny_align_to_tree_mafft_fasttree(
-            input_sequences=out_dir / "rep-seqs.qza",
+            input_sequences=rep_dest,
             output_alignment=out_dir / "aligned-rep-seqs.qza",
             output_masked_alignment=out_dir / "masked-aligned-rep-seqs.qza",
             output_tree=out_dir / "unrooted-tree.qza",
@@ -174,7 +241,7 @@ def _stage_three(
     table_qzv = out_dir / "table.qzv"
     if not table_qzv.exists():
         qiime.feature_table_summarize(
-            input_table=out_dir / "table.qza",
+            input_table=tbl_dest,
             output=table_qzv,
             sample_metadata_file=meta_aug,
             dry_run=dry_run,
@@ -188,7 +255,7 @@ def _stage_three(
         return
     qiime.diversity_core_metrics_phylogenetic(
         input_phylogeny=rooted,
-        input_table=out_dir / "table.qza",
+        input_table=tbl_dest,
         sampling_depth=depth,
         metadata_file=meta_aug,
         output_dir=core_dir,
@@ -212,7 +279,6 @@ def _select_groups(merged_index: Dict[str, dict], groups_arg: Optional[str]) -> 
     if not want:
         return set(merged_index.keys())
     # Accept either the group key (e.g., "all" or "F|R") or the slug folder name
-    # Build slug map
     slug_to_key = {slugify(k if k else "all"): k for k in merged_index}
     out: Set[str] = set()
     for g in want:
@@ -233,7 +299,6 @@ def _winner_if_present(group_dir: Path) -> Optional[str]:
         return None
     try:
         data = json.loads(report.read_text())
-        # try priorities in order
         for key in ("pct_depth≥7", "median_conf", "mean_conf"):
             winners = data.get("winners", {}).get(key, [])
             if winners:
@@ -250,7 +315,6 @@ def run(args) -> None:
 
     project_dir.mkdir(parents=True, exist_ok=True)
 
-    # Step 0: optional init and stop
     if args.init_metadata:
         _init_and_exit(
             fastq_dir=fastq_dir,
@@ -261,7 +325,6 @@ def run(args) -> None:
             id_regex=args.id_regex,
         )
 
-    # Require metadata to proceed
     meta_path = meta_path or (project_dir / "metadata.tsv")
     if not meta_path.exists():
         print(f"error: metadata file not found: {meta_path} (use --init-metadata first)", file=sys.stderr)
@@ -276,7 +339,6 @@ def run(args) -> None:
         args.skip_denoise = True
 
     if not args.skip_denoise:
-        # Run per-run/group pipeline to produce merged outputs
         ns = SimpleNamespace(
             fastq_dir=fastq_dir,
             project_dir=project_dir,
@@ -310,7 +372,6 @@ def run(args) -> None:
         )
         cmd_denoise.run(ns)
 
-    # Load (or require) merged index
     try:
         merged_index = _load_merged_index(project_dir)
     except FileNotFoundError:
@@ -318,13 +379,12 @@ def run(args) -> None:
               file=sys.stderr)
         sys.exit(3)
 
-    # Restrict to selected groups (if any)
     selected = _select_groups(merged_index, args.groups)
     if not selected:
         print("error: no matching groups found to operate on.", file=sys.stderr)
         sys.exit(4)
 
-    # Stage 3: classifier sweep (unless skipped / resume)
+    # Stage 3: classifier sweep
     winners: dict[str, dict] = {}
     classifiers_ok = (args.classifiers_dir and Path(args.classifiers_dir).is_dir())
 
@@ -355,12 +415,12 @@ def run(args) -> None:
         winners[group_key] = res
         print(f"[ok] group={group_key} classifier winner={res['classifier_tag']} by {res['priority']}")
 
-    # Stage 4: phylogeny + core metrics (unless skipped / resume)
     if args.skip_metrics:
         LOG.info("Skipping core metrics per user request.")
         print(f"[ok] auto-run (skipped metrics) → {project_dir}")
         return
 
+    # Stage 4: phylogeny + core metrics (resume-aware, and robust staging)
     meta_aug = project_dir / "metadata.augmented.tsv"
     for group_key in sorted(selected):
         rec = merged_index[group_key]
@@ -368,13 +428,11 @@ def run(args) -> None:
         table = group_dir / "table.qza"
         rep_seqs = group_dir / "rep-seqs.qza"
 
-        # If classification was skipped or has no winner, taxonomy is optional.
         taxonomy = None
         if (group_key in winners) and winners[group_key].get("classifier_tag"):
             tag = winners[group_key]["classifier_tag"]
             taxonomy = group_dir / "classifiers" / f"{tag}_classification.qza"
 
-        # If resume and core metrics already exist, skip
         if args.resume and (group_dir / "core-metrics-phylo").exists():
             LOG.info("Resume: core-metrics present for group=%s; skipping.", group_key)
             continue
@@ -384,7 +442,7 @@ def run(args) -> None:
             table=table,
             taxonomy=taxonomy,
             meta_aug=meta_aug,
-            out_dir=group_dir,  # keep analysis beside the merged outputs
+            out_dir=group_dir,
             dry_run=getattr(args, "dry_run", False),
             show_qiime=getattr(args, "show_qiime", True),
             retain_fraction=args.retain_fraction,
