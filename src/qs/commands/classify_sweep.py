@@ -5,7 +5,7 @@ import json
 import statistics
 import zipfile
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 from qs.utils.logger import get_logger
 from qs.qiime import commands as qiime
@@ -21,13 +21,13 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--input-reads", type=Path, required=True, help="FeatureData[Sequence] .qza (rep-seqs).")
     p.add_argument("--classifiers-dir", type=Path, required=True, help="Directory of *.qza sklearn classifiers.")
     p.add_argument("--output-dir", type=Path, required=True, help="Directory to write classifications and report.")
+    p.add_argument("--reads-per-batch", default="1000", help="Reads per batch (int or 'auto'; default 1000).")
+    p.add_argument("--n-jobs", type=int, default=1, help="sklearn n_jobs (default 1).")
+    p.add_argument("--blas-threads", type=int, default=1, help="Pin BLAS threads (OMP/MKL/OPENBLAS/NUMEXPR) (default 1).")
     p.set_defaults(func=run)
 
 
 def _extract_metrics(tax_qza: Path) -> Dict[str, float]:
-    """
-    Read taxonomy.tsv inside taxonomy.qza and compute summary metrics.
-    """
     try:
         with zipfile.ZipFile(tax_qza) as z:
             tsv = z.read(next(p for p in z.namelist() if p.endswith("taxonomy.tsv"))).decode()
@@ -64,6 +64,19 @@ def _extract_metrics(tax_qza: Path) -> Dict[str, float]:
     }
 
 
+def _parse_reads_per_batch(val: Union[str, int]) -> Union[str, int]:
+    if isinstance(val, int):
+        return val
+    s = str(val).strip().lower()
+    if s == "auto":
+        return "auto"
+    try:
+        n = int(s)
+        return max(1, n)
+    except Exception:
+        return 1000
+
+
 def sweep_and_pick(
     *,
     input_reads: Path,
@@ -71,9 +84,22 @@ def sweep_and_pick(
     out_dir: Path,
     dry_run: bool,
     show_qiime: bool,
+    n_jobs: int = 1,
+    reads_per_batch: Union[str, int] = 1000,
+    blas_threads: int = 1,
 ) -> Dict[str, object]:
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_list: List[Tuple[str, Dict[str, float]]] = []
+
+    # Limit BLAS/OpenMP thread explosions
+    extra_env = {
+        "OMP_NUM_THREADS": str(blas_threads),
+        "OPENBLAS_NUM_THREADS": str(blas_threads),
+        "MKL_NUM_THREADS": str(blas_threads),
+        "NUMEXPR_NUM_THREADS": str(blas_threads),
+    }
+
+    rpb = _parse_reads_per_batch(reads_per_batch)
 
     for cls in sorted(classifiers_dir.glob("*.qza")):
         tag = cls.stem
@@ -83,8 +109,14 @@ def sweep_and_pick(
                 input_reads=input_reads,
                 input_classifier=cls,
                 output_classification=out_tax,
+                reads_per_batch=rpb,
+                n_jobs=n_jobs,
+                pre_dispatch="1*n_jobs",
+                confidence=0.7,
+                read_orientation="auto",
                 dry_run=dry_run,
                 show_stdout=show_qiime,
+                extra_env=extra_env,
             )
         m = _extract_metrics(out_tax)
         if m:
@@ -105,14 +137,12 @@ def sweep_and_pick(
     (out_dir / "optimal_classifiers.json").write_text(json.dumps(report, indent=2) + "\n")
     LOG.info("Classifier sweep report → %s", out_dir / "optimal_classifiers.json")
 
-    # choose a single final winner by priority
     for key in rank_keys:
         pick = winners.get(key, [])
         if pick:
             return {"priority": key, "classifier_tag": pick[0]["classifier"], "report_path": str(out_dir / "optimal_classifiers.json")}
-    # fallback
     return {"priority": "mean_conf", "classifier_tag": sorted(metrics_list, key=lambda kv: kv[1].get("mean_conf", 0.0), reverse=True)[0][0]}
-    
+
 
 def run(args) -> None:
     res = sweep_and_pick(
@@ -121,6 +151,9 @@ def run(args) -> None:
         out_dir=args.output_dir,
         dry_run=getattr(args, "dry_run", False),
         show_qiime=getattr(args, "show_qiime", True),
+        n_jobs=args.n_jobs,
+        reads_per_batch=args.reads_per_batch,
+        blas_threads=args.blas_threads,
     )
     LOG.info("Winner: %s (by %s)", res["classifier_tag"], res["priority"])
     print(f"[ok] winner={res['classifier_tag']} by {res['priority']}")
