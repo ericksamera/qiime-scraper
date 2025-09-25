@@ -85,7 +85,7 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--pooling-method", type=str, default="independent")
     p.add_argument("--chimera-method", type=str, default="consensus")
 
-    # Classifier sweep (directory of sklearn classifiers)
+    # Classifier sweep
     p.add_argument("--classifiers-dir", type=Path, default=None,
                    help="Directory of sklearn classifier .qza files (if omitted, skip sweep).")
 
@@ -139,8 +139,10 @@ def _stage_three(
 ) -> None:
     """
     Prepare analysis in out_dir and run phylogeny + core metrics.
-    Robust to files already being in-place; avoids self-referential symlinks.
-    If rep-seqs.qza is missing/broken, auto-repair from per-run outputs.
+
+    - Avoids self-referential links
+    - Auto-repairs missing/broken rep-seqs.qza and table.qza from per-run outputs
+    - Resume-safe: keeps existing good outputs
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -148,83 +150,103 @@ def _stage_three(
         return p.is_symlink() and not p.exists()
 
     def _stage_artifact(src: Path, dest: Path) -> None:
-        # If src == dest (same path), do nothing
         if str(src) == str(dest):
-            LOG.debug("Artifact already in place: %s", dest)
+            # already in place
             return
-        # If dest exists and already points to same file, keep
         if dest.exists() or dest.is_symlink():
             try:
                 if dest.resolve() == src.resolve():
-                    LOG.debug("Reusing existing artifact: %s", dest)
                     return
             except Exception:
                 pass
-            # otherwise remove old/broken
             try:
                 dest.unlink()
             except FileNotFoundError:
                 pass
-        # Prefer hardlink; fallback to symlink; fallback to copy
+        # prefer hardlink → symlink → copy
         try:
             os.link(src, dest)
-            LOG.debug("Hardlinked %s → %s", src, dest)
             return
         except Exception:
             try:
                 dest.symlink_to(src)
-                LOG.debug("Symlinked %s → %s", src, dest)
                 return
             except Exception:
                 import shutil
                 shutil.copy2(src, dest)
-                LOG.debug("Copied %s → %s", src, dest)
 
-    # --- auto-repair broken/missing rep-seqs.qza ---
-    # If the group rep-seqs is missing (or a broken self-symlink), rebuild from per-run rep-seqs.
+    # locate project root and runs root
+    group_slug = out_dir.name
+    project_dir = out_dir.parent.parent  # .../project/groups/<slug> → project/
+    runs_root = project_dir / "runs"
+
+    # --- repair rep-seqs if missing/broken ---
     if (not rep_seqs.exists()) or _is_broken_symlink(rep_seqs):
-        group_slug = out_dir.name
-        project_dir = out_dir.parent.parent  # .../project/groups/<slug> → project/
-        runs_root = project_dir / "runs"
         per_run_rep = sorted(runs_root.glob(f"*/{group_slug}/rep-seqs.qza"))
         if not per_run_rep:
-            raise FileNotFoundError(f"rep-seqs.qza missing and no per-run rep-seqs found under {runs_root}/ */{group_slug}/")
+            raise FileNotFoundError(
+                f"rep-seqs.qza missing and no per-run rep-seqs found under {runs_root}/ */{group_slug}/"
+            )
         if len(per_run_rep) == 1:
-            # single run — just copy it back
             import shutil
             rep_seqs.parent.mkdir(parents=True, exist_ok=True)
-            if rep_seqs.exists() or rep_seqs.is_symlink():
-                try:
-                    rep_seqs.unlink()
-                except Exception:
-                    pass
+            try:
+                rep_seqs.unlink()
+            except Exception:
+                pass
             shutil.copy2(per_run_rep[0], rep_seqs)
             LOG.warning("Repaired rep-seqs.qza by copying from %s", per_run_rep[0])
         else:
-            # multiple runs — merge
             tmp_merged = out_dir / "_rep-seqs.repaired.qza"
             qiime.merge_seqs(per_run_rep, tmp_merged, dry_run=dry_run, show_stdout=show_qiime)
-            if rep_seqs.exists() or rep_seqs.is_symlink():
-                try:
-                    rep_seqs.unlink()
-                except Exception:
-                    pass
+            try:
+                rep_seqs.unlink()
+            except Exception:
+                pass
             os.replace(tmp_merged, rep_seqs)
             LOG.warning("Repaired rep-seqs.qza by merging %d per-run files", len(per_run_rep))
 
-    # Stage artifacts into out_dir only if they are elsewhere
+    # --- repair table if missing/broken ---
+    if (not table.exists()) or _is_broken_symlink(table):
+        # most common (split-by-primer-group): tables are in runs/*/<group>/table.qza
+        per_run_tbl = sorted(runs_root.glob(f"*/{group_slug}/table.qza"))
+        # fallback: if user ran without split and group is 'all'
+        if not per_run_tbl and group_slug == "all":
+            per_run_tbl = sorted(runs_root.glob("*/table.qza"))
+        if not per_run_tbl:
+            raise FileNotFoundError(
+                f"table.qza missing and no per-run tables found under {runs_root}/ */{group_slug}/"
+            )
+        if len(per_run_tbl) == 1:
+            import shutil
+            table.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                table.unlink()
+            except Exception:
+                pass
+            shutil.copy2(per_run_tbl[0], table)
+            LOG.warning("Repaired table.qza by copying from %s", per_run_tbl[0])
+        else:
+            tmp_tbl = out_dir / "_table.repaired.qza"
+            qiime.merge_tables(per_run_tbl, tmp_tbl, dry_run=dry_run, show_stdout=show_qiime)
+            try:
+                table.unlink()
+            except Exception:
+                pass
+            os.replace(tmp_tbl, table)
+            LOG.warning("Repaired table.qza by merging %d per-run files", len(per_run_tbl))
+
+    # stage artifacts into out_dir if their source is elsewhere
     rep_dest = out_dir / "rep-seqs.qza"
     tbl_dest = out_dir / "table.qza"
     if rep_seqs.exists() and not _is_broken_symlink(rep_seqs):
         _stage_artifact(rep_seqs, rep_dest)
-    if table.exists():
+    if table.exists() and not _is_broken_symlink(table):
         _stage_artifact(table, tbl_dest)
-    if taxonomy:
-        tax_dest = out_dir / "taxonomy.qza"
-        if taxonomy.exists():
-            _stage_artifact(taxonomy, tax_dest)
+    if taxonomy and taxonomy.exists():
+        _stage_artifact(taxonomy, out_dir / "taxonomy.qza")
 
-    # Build phylogeny
+    # build phylogeny (only if needed)
     rooted = out_dir / "rooted-tree.qza"
     if not rooted.exists():
         qiime.phylogeny_align_to_tree_mafft_fasttree(
@@ -237,7 +259,7 @@ def _stage_three(
             show_stdout=show_qiime,
         )
 
-    # choose depth (expects table.qzv nearby — created during merge; if not there, create it)
+    # ensure we have a table summary to decide depth
     table_qzv = out_dir / "table.qzv"
     if not table_qzv.exists():
         qiime.feature_table_summarize(
@@ -278,13 +300,11 @@ def _select_groups(merged_index: Dict[str, dict], groups_arg: Optional[str]) -> 
     want = {g.strip() for g in groups_arg.split(",") if g.strip()}
     if not want:
         return set(merged_index.keys())
-    # Accept either the group key (e.g., "all" or "F|R") or the slug folder name
     slug_to_key = {slugify(k if k else "all"): k for k in merged_index}
     out: Set[str] = set()
     for g in want:
         if g in merged_index:
-            out.add(g)
-            continue
+            out.add(g); continue
         if g in slug_to_key:
             out.add(slug_to_key[g])
     if not out:
