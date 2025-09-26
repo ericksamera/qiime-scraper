@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Dict, Optional, Set
 
 from qs.utils.logger import get_logger
-from qs.analysis.metrics import stage_and_run_metrics_for_group
+from qs.analysis.metrics import stage_and_run_metrics_for_group, write_alpha_metrics_tsv
 from qs.utils.text import slugify
 
 LOG = get_logger("coremetrics")
@@ -34,6 +34,8 @@ def setup_parser(subparsers, parent) -> None:
                    help="Minimum sampling depth (default 1000).")
     p.add_argument("--if-exists", choices=("skip", "overwrite", "error", "new"), default="skip",
                    help="How to handle existing core-metrics-phylo directory (default: skip).")
+    p.add_argument("--alpha-tsv", action="store_true",
+                   help="Also write <group>/core-metrics-phylo/alpha-metrics.tsv.")
     p.set_defaults(func=run)
 
 
@@ -85,5 +87,11 @@ def run(args) -> None:
             dry_run=getattr(args, "dry_run", False),
             show_qiime=getattr(args, "show_qiime", True),
         )
+        if args.alpha_tsv:
+            try:
+                path = write_alpha_metrics_tsv(core_dir)
+                LOG.info("Alpha metrics → %s", path)
+            except Exception as e:
+                LOG.warning("Alpha TSV export skipped for %s: %s", key, e)
         LOG.info("Group %s → %s", key, core_dir)
         print(f"[ok] core metrics: {group_dir}")

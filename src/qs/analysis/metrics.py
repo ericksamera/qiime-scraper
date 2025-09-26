@@ -1,99 +1,18 @@
 # src/qs/analysis/metrics.py
 from __future__ import annotations
 
-import os
+import zipfile
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Dict, Optional, Sequence
 
+from qs.analysis.staging import (
+    _is_broken_symlink,
+    _stage_artifact,
+    _repair_rep_seqs,
+    _repair_table,
+)
 from qs.qiime import commands as qiime
 from qs.analysis.depth import choose_sampling_depth
-
-
-def _is_broken_symlink(p: Path) -> bool:
-    return p.is_symlink() and not p.exists()
-
-
-def _stage_artifact(src: Path, dest: Path) -> None:
-    # no-ops if same path or already the same target
-    if str(src) == str(dest):
-        return
-    if dest.exists() or dest.is_symlink():
-        try:
-            if dest.resolve() == src.resolve():
-                return
-        except Exception:
-            pass
-        try:
-            dest.unlink()
-        except FileNotFoundError:
-            pass
-    # prefer hardlink → symlink → copy
-    try:
-        os.link(src, dest)
-        return
-    except Exception:
-        try:
-            dest.symlink_to(src)
-            return
-        except Exception:
-            import shutil
-            shutil.copy2(src, dest)
-
-
-def _repair_rep_seqs(group_slug: str, group_dir: Path, rep_seqs: Path,
-                     *, dry_run: bool, show_qiime: bool) -> None:
-    project_dir = group_dir.parent.parent  # .../project/groups/<slug> → project/
-    runs_root = project_dir / "runs"
-    per_run_rep = sorted(runs_root.glob(f"*/{group_slug}/rep-seqs.qza"))
-    if not per_run_rep:
-        raise FileNotFoundError(
-            f"rep-seqs.qza missing and no per-run rep-seqs found under {runs_root}/ */{group_slug}/"
-        )
-    if len(per_run_rep) == 1:
-        import shutil
-        rep_seqs.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            rep_seqs.unlink()
-        except Exception:
-            pass
-        shutil.copy2(per_run_rep[0], rep_seqs)
-    else:
-        tmp_merged = group_dir / "_rep-seqs.repaired.qza"
-        qiime.merge_seqs(per_run_rep, tmp_merged, dry_run=dry_run, show_stdout=show_qiime)
-        try:
-            rep_seqs.unlink()
-        except Exception:
-            pass
-        os.replace(tmp_merged, rep_seqs)
-
-
-def _repair_table(group_slug: str, group_dir: Path, table: Path,
-                  *, dry_run: bool, show_qiime: bool) -> None:
-    project_dir = group_dir.parent.parent
-    runs_root = project_dir / "runs"
-    per_run_tbl = sorted(runs_root.glob(f"*/{group_slug}/table.qza"))
-    if not per_run_tbl and group_slug == "all":
-        per_run_tbl = sorted(runs_root.glob("*/table.qza"))
-    if not per_run_tbl:
-        raise FileNotFoundError(
-            f"table.qza missing and no per-run tables found under {runs_root}/ */{group_slug}/"
-        )
-    if len(per_run_tbl) == 1:
-        import shutil
-        table.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            table.unlink()
-        except Exception:
-            pass
-        shutil.copy2(per_run_tbl[0], table)
-    else:
-        tmp_tbl = group_dir / "_table.repaired.qza"
-        qiime.merge_tables(per_run_tbl, tmp_tbl, dry_run=dry_run, show_stdout=show_qiime)
-        try:
-            table.unlink()
-        except Exception:
-            pass
-        os.replace(tmp_tbl, table)
 
 
 def stage_and_run_metrics_for_group(
@@ -174,3 +93,68 @@ def stage_and_run_metrics_for_group(
         show_stdout=show_qiime,
     )
     return core_dir
+
+
+def write_alpha_metrics_tsv(core_metrics_dir: Path, out_tsv: Optional[Path] = None) -> Path:
+    """
+    Merge core-metrics alpha vectors into a single TSV with columns:
+    sample-id, observed_features, evenness, faith_pd, shannon
+    """
+    alpha_qzas = {
+        "observed_features": core_metrics_dir / "observed_features_vector.qza",
+        "evenness":          core_metrics_dir / "evenness_vector.qza",
+        "faith_pd":          core_metrics_dir / "faith_pd_vector.qza",
+        "shannon":           core_metrics_dir / "shannon_vector.qza",
+    }
+
+    def _read_alpha_vec(qza: Path) -> Dict[str, float]:
+        if not qza.exists():
+            return {}
+        try:
+            with zipfile.ZipFile(qza) as z:
+                # Most SampleData[AlphaDiversity] artifacts include data/alpha-diversity.tsv
+                tsv_name = next((p for p in z.namelist() if p.endswith("alpha-diversity.tsv")), None)
+                if not tsv_name:
+                    tsv_name = next((p for p in z.namelist() if p.endswith(".tsv")), None)
+                if not tsv_name:
+                    return {}
+                lines = z.read(tsv_name).decode("utf-8").splitlines()
+        except Exception:
+            return {}
+        if not lines:
+            return {}
+        header = [h.strip().lower() for h in lines[0].split("\t")]
+        try:
+            sid_idx = next(i for i, h in enumerate(header) if h in {"#sampleid", "sample-id", "sample id", "sampleid"})
+        except StopIteration:
+            sid_idx = 0
+        val_idx = next((i for i, h in enumerate(header) if h in {"value", "alpha-diversity", "alpha_diversity"}), 1 if len(header) > 1 else 0)
+        out: Dict[str, float] = {}
+        for ln in lines[1:]:
+            cols = ln.split("\t")
+            if len(cols) <= max(sid_idx, val_idx):
+                continue
+            sid = cols[sid_idx].lstrip("#").strip()
+            try:
+                out[sid] = float(cols[val_idx])
+            except Exception:
+                continue
+        return out
+
+    columns: Dict[str, Dict[str, float]] = {k: _read_alpha_vec(p) for k, p in alpha_qzas.items()}
+    if not any(columns.values()):
+        raise FileNotFoundError(f"No alpha diversity vectors found under {core_metrics_dir}")
+
+    all_sids = sorted({sid for col in columns.values() for sid in col.keys()})
+    out_tsv = out_tsv or (core_metrics_dir / "alpha-metrics.tsv")
+    with out_tsv.open("w", encoding="utf-8") as fh:
+        fh.write("sample-id\tobserved_features\tevenness\tfaith_pd\tshannon\n")
+        for sid in all_sids:
+            fh.write(
+                f"{sid}\t"
+                f"{columns.get('observed_features', {}).get(sid, '')}\t"
+                f"{columns.get('evenness', {}).get(sid, '')}\t"
+                f"{columns.get('faith_pd', {}).get(sid, '')}\t"
+                f"{columns.get('shannon', {}).get(sid, '')}\n"
+            )
+    return out_tsv

@@ -2,11 +2,10 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Set
+from typing import Dict, Optional, Set
 
 from qs.utils.logger import get_logger
 from qs.utils.samples import discover_fastqs, paired_sample_ids
@@ -14,8 +13,8 @@ from qs.metadata.template import write_metadata_template
 from qs.utils.manifest import generate_manifest
 from qs.commands import denoise_runs as cmd_denoise
 from qs.commands import classify_sweep as cmd_cls
-from qs.qiime import commands as qiime
-from qs.analysis.depth import choose_sampling_depth
+from qs.analysis.metrics import stage_and_run_metrics_for_group
+from qs.analysis.staging import _stage_artifact
 from qs.utils.text import slugify
 
 LOG = get_logger("auto")
@@ -94,6 +93,8 @@ def setup_parser(subparsers, parent) -> None:
                    help="Fraction of samples to retain when choosing depth.")
     p.add_argument("--min-depth", type=int, default=1000,
                    help="Minimum sampling depth.")
+    p.add_argument("--alpha-tsv", action="store_true",
+                   help="Also write <group>/core-metrics-phylo/alpha-metrics.tsv.")
 
     p.set_defaults(func=run)
 
@@ -135,156 +136,36 @@ def _stage_three(
     dry_run: bool,
     show_qiime: bool,
     retain_fraction: float,
-    min_depth: int
+    min_depth: int,
+    alpha_tsv: bool = False
 ) -> None:
-    """
-    Prepare analysis in out_dir and run phylogeny + core metrics.
-
-    - Avoids self-referential links
-    - Auto-repairs missing/broken rep-seqs.qza and table.qza from per-run outputs
-    - Resume-safe: keeps existing good outputs
-    """
+    """Run phylogeny + core metrics via the shared implementation (resume-safe)."""
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    def _is_broken_symlink(p: Path) -> bool:
-        return p.is_symlink() and not p.exists()
-
-    def _stage_artifact(src: Path, dest: Path) -> None:
-        if str(src) == str(dest):
-            # already in place
-            return
-        if dest.exists() or dest.is_symlink():
-            try:
-                if dest.resolve() == src.resolve():
-                    return
-            except Exception:
-                pass
-            try:
-                dest.unlink()
-            except FileNotFoundError:
-                pass
-        # prefer hardlink → symlink → copy
-        try:
-            os.link(src, dest)
-            return
-        except Exception:
-            try:
-                dest.symlink_to(src)
-                return
-            except Exception:
-                import shutil
-                shutil.copy2(src, dest)
-
-    # locate project root and runs root
-    group_slug = out_dir.name
-    project_dir = out_dir.parent.parent  # .../project/groups/<slug> → project/
-    runs_root = project_dir / "runs"
-
-    # --- repair rep-seqs if missing/broken ---
-    if (not rep_seqs.exists()) or _is_broken_symlink(rep_seqs):
-        per_run_rep = sorted(runs_root.glob(f"*/{group_slug}/rep-seqs.qza"))
-        if not per_run_rep:
-            raise FileNotFoundError(
-                f"rep-seqs.qza missing and no per-run rep-seqs found under {runs_root}/ */{group_slug}/"
-            )
-        if len(per_run_rep) == 1:
-            import shutil
-            rep_seqs.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                rep_seqs.unlink()
-            except Exception:
-                pass
-            shutil.copy2(per_run_rep[0], rep_seqs)
-            LOG.warning("Repaired rep-seqs.qza by copying from %s", per_run_rep[0])
-        else:
-            tmp_merged = out_dir / "_rep-seqs.repaired.qza"
-            qiime.merge_seqs(per_run_rep, tmp_merged, dry_run=dry_run, show_stdout=show_qiime)
-            try:
-                rep_seqs.unlink()
-            except Exception:
-                pass
-            os.replace(tmp_merged, rep_seqs)
-            LOG.warning("Repaired rep-seqs.qza by merging %d per-run files", len(per_run_rep))
-
-    # --- repair table if missing/broken ---
-    if (not table.exists()) or _is_broken_symlink(table):
-        # most common (split-by-primer-group): tables are in runs/*/<group>/table.qza
-        per_run_tbl = sorted(runs_root.glob(f"*/{group_slug}/table.qza"))
-        # fallback: if user ran without split and group is 'all'
-        if not per_run_tbl and group_slug == "all":
-            per_run_tbl = sorted(runs_root.glob("*/table.qza"))
-        if not per_run_tbl:
-            raise FileNotFoundError(
-                f"table.qza missing and no per-run tables found under {runs_root}/ */{group_slug}/"
-            )
-        if len(per_run_tbl) == 1:
-            import shutil
-            table.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                table.unlink()
-            except Exception:
-                pass
-            shutil.copy2(per_run_tbl[0], table)
-            LOG.warning("Repaired table.qza by copying from %s", per_run_tbl[0])
-        else:
-            tmp_tbl = out_dir / "_table.repaired.qza"
-            qiime.merge_tables(per_run_tbl, tmp_tbl, dry_run=dry_run, show_stdout=show_qiime)
-            try:
-                table.unlink()
-            except Exception:
-                pass
-            os.replace(tmp_tbl, table)
-            LOG.warning("Repaired table.qza by merging %d per-run files", len(per_run_tbl))
-
-    # stage artifacts into out_dir if their source is elsewhere
-    rep_dest = out_dir / "rep-seqs.qza"
-    tbl_dest = out_dir / "table.qza"
-    if rep_seqs.exists() and not _is_broken_symlink(rep_seqs):
-        _stage_artifact(rep_seqs, rep_dest)
-    if table.exists() and not _is_broken_symlink(table):
-        _stage_artifact(table, tbl_dest)
+    # Idempotent staging into expected filenames inside out_dir
+    if rep_seqs and rep_seqs.exists():
+        _stage_artifact(rep_seqs, out_dir / "rep-seqs.qza")
+    if table and table.exists():
+        _stage_artifact(table, out_dir / "table.qza")
     if taxonomy and taxonomy.exists():
         _stage_artifact(taxonomy, out_dir / "taxonomy.qza")
 
-    # build phylogeny (only if needed)
-    rooted = out_dir / "rooted-tree.qza"
-    if not rooted.exists():
-        qiime.phylogeny_align_to_tree_mafft_fasttree(
-            input_sequences=rep_dest,
-            output_alignment=out_dir / "aligned-rep-seqs.qza",
-            output_masked_alignment=out_dir / "masked-aligned-rep-seqs.qza",
-            output_tree=out_dir / "unrooted-tree.qza",
-            output_rooted_tree=rooted,
-            dry_run=dry_run,
-            show_stdout=show_qiime,
-        )
-
-    # ensure we have a table summary to decide depth
-    table_qzv = out_dir / "table.qzv"
-    if not table_qzv.exists():
-        qiime.feature_table_summarize(
-            input_table=tbl_dest,
-            output=table_qzv,
-            sample_metadata_file=meta_aug,
-            dry_run=dry_run,
-            show_stdout=show_qiime,
-        )
-    depth = choose_sampling_depth(table_qzv, retain_fraction=retain_fraction, min_depth=min_depth)
-
-    core_dir = out_dir / "core-metrics-phylo"
-    if core_dir.exists():
-        LOG.info("Core metrics already present → %s (resume)", core_dir)
-        return
-    qiime.diversity_core_metrics_phylogenetic(
-        input_phylogeny=rooted,
-        input_table=tbl_dest,
-        sampling_depth=depth,
-        metadata_file=meta_aug,
-        output_dir=core_dir,
+    core_dir = stage_and_run_metrics_for_group(
+        group_dir=out_dir,
+        metadata_augmented=meta_aug,
+        retain_fraction=retain_fraction,
+        min_depth=min_depth,
+        if_exists="skip",
         dry_run=dry_run,
-        show_stdout=show_qiime,
+        show_qiime=show_qiime,
     )
-    LOG.info("Core metrics done (depth=%d) → %s", depth, core_dir)
+    LOG.info("Core metrics done → %s", core_dir)
+    if alpha_tsv:
+        from qs.analysis.metrics import write_alpha_metrics_tsv
+        try:
+            path = write_alpha_metrics_tsv(out_dir / "core-metrics-phylo")
+            LOG.info("Alpha metrics → %s", path)
+        except Exception as e:
+            LOG.warning("Alpha TSV export skipped: %s", e)
 
 
 def _load_merged_index(project_dir: Path) -> Dict[str, dict]:
@@ -467,6 +348,7 @@ def run(args) -> None:
             show_qiime=getattr(args, "show_qiime", True),
             retain_fraction=args.retain_fraction,
             min_depth=args.min_depth,
-        )
+            alpha_tsv=getattr(args, "alpha_tsv", False)
+            )
 
     print(f"[ok] auto-run complete → {project_dir}")
