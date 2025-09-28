@@ -24,12 +24,12 @@ def stage_and_run_metrics_for_group(
     if_exists: str = "skip",  # skip|overwrite|error|new
     dry_run: bool = False,
     show_qiime: bool = False,
+    make_taxa_barplot: bool = True,
 ) -> Path:
     """
     Ensure rep-seqs.qza & table.qza exist in group_dir (repair if needed),
+    optionally emit taxa-barplot if taxonomy.qza is present,
     then build phylogeny and run core metrics.
-
-    Returns path to the core-metrics-phylo directory (or the new one if 'new').
     """
     group_dir.mkdir(parents=True, exist_ok=True)
     slug = group_dir.name
@@ -42,9 +42,21 @@ def stage_and_run_metrics_for_group(
     if (not tbl_src.exists()) or _is_broken_symlink(tbl_src):
         _repair_table(slug, group_dir, tbl_src, dry_run=dry_run, show_qiime=show_qiime)
 
-    # re-stage to local filenames (no-ops if already correct)
     _stage_artifact(rep_src, group_dir / "rep-seqs.qza")
     _stage_artifact(tbl_src, group_dir / "table.qza")
+
+    # taxa barplot (fast) if taxonomy present
+    tax = group_dir / "taxonomy.qza"
+    barplot_qzv = group_dir / "taxa-barplot.qzv"
+    if make_taxa_barplot and tax.exists() and not barplot_qzv.exists():
+        qiime.taxa_barplot(
+            input_table=group_dir / "table.qza",
+            input_taxonomy=tax,
+            metadata_file=metadata_augmented,
+            output_visualization=barplot_qzv,
+            dry_run=dry_run,
+            show_stdout=show_qiime,
+        )
 
     rooted = group_dir / "rooted-tree.qza"
     if not rooted.exists():
@@ -70,7 +82,6 @@ def stage_and_run_metrics_for_group(
     depth = choose_sampling_depth(table_qzv, retain_fraction=retain_fraction, min_depth=min_depth)
 
     core_dir = group_dir / "core-metrics-phylo"
-    # if_exists policy
     if core_dir.exists():
         if if_exists == "skip":
             return core_dir
@@ -112,7 +123,6 @@ def write_alpha_metrics_tsv(core_metrics_dir: Path, out_tsv: Optional[Path] = No
             return {}
         try:
             with zipfile.ZipFile(qza) as z:
-                # Most SampleData[AlphaDiversity] artifacts include data/alpha-diversity.tsv
                 tsv_name = next((p for p in z.namelist() if p.endswith("alpha-diversity.tsv")), None)
                 if not tsv_name:
                     tsv_name = next((p for p in z.namelist() if p.endswith(".tsv")), None)

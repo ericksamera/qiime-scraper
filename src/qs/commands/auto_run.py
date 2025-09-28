@@ -15,6 +15,9 @@ from qs.commands import denoise_runs as cmd_denoise
 from qs.commands import classify_sweep as cmd_cls
 from qs.analysis.metrics import stage_and_run_metrics_for_group
 from qs.analysis.staging import _stage_artifact
+from qs.analysis.filtering import compute_min_freq_from_qzv, filter_table_and_seqs
+from qs.analysis.depth import mean_sample_depth
+from qs.analysis.stats import run_diversity_stats_for_group
 from qs.utils.text import slugify
 
 LOG = get_logger("auto")
@@ -26,7 +29,7 @@ def setup_parser(subparsers, parent) -> None:
         help=(
             "End-to-end pipeline with resume: "
             "(optional init) → per-run/group import+cutadapt+DADA2(+auto trunc) → merge "
-            "→ classifier sweep → core metrics."
+            "→ classifier sweep → filtering → core metrics (+optional stats)."
         ),
     )
     # Init / inputs
@@ -42,33 +45,22 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--id-regex", type=str, default=None, help="Optional regex to derive SampleID (named 'id' or group 1).")
 
     # Stage skipping / resume / selection
-    p.add_argument("--skip-denoise", action="store_true",
-                   help="Skip import/cutadapt/DADA2/merge and reuse existing MERGED.json.")
-    p.add_argument("--skip-classify", action="store_true",
-                   help="Skip classifier sweep.")
-    p.add_argument("--skip-metrics", action="store_true",
-                   help="Skip phylogeny + core metrics.")
-    p.add_argument("--resume", action="store_true",
-                   help="Auto-skip stages with completed outputs (idempotent resume).")
-    p.add_argument("--groups", type=str, default=None,
-                   help="Comma-separated group keys or slugs to operate on (default: all).")
+    p.add_argument("--skip-denoise", action="store_true", help="Skip import/cutadapt/DADA2/merge and reuse existing MERGED.json.")
+    p.add_argument("--skip-classify", action="store_true", help="Skip classifier sweep.")
+    p.add_argument("--skip-metrics", action="store_true", help="Skip phylogeny + core metrics.")
+    p.add_argument("--resume", action="store_true", help="Auto-skip stages with completed outputs (idempotent resume).")
+    p.add_argument("--groups", type=str, default=None, help="Comma-separated group keys or slugs to operate on (default: all).")
 
-    # Denoise pipeline knobs (forwarded to denoise-runs)
-    p.add_argument("--split-by-primer-group", action="store_true",
-                   help="Per primer group within each run (recommended for mixed loci).")
-    p.add_argument("--discard-untrimmed", action="store_true",
-                   help="cutadapt: discard reads without primer.")
-    p.add_argument("--no-indels", action="store_true",
-                   help="cutadapt: exact matches only.")
+    # Denoise knobs (forwarded)
+    p.add_argument("--split-by-primer-group", action="store_true", help="Per primer group within each run.")
+    p.add_argument("--discard-untrimmed", action="store_true", help="cutadapt: discard reads without primer.")
+    p.add_argument("--no-indels", action="store_true", help="cutadapt: exact matches only.")
     p.add_argument("--cores", type=int, default=0, help="Cores for cutadapt & DADA2.")
 
     # Auto truncation (forwarded)
-    p.add_argument("--auto-trunc", action="store_true",
-                   help="Auto optimize trunc-len-f/r per run/group.")
-    p.add_argument("--trunc-len-f", type=int, default=0,
-                   help="Override trunc-len-f (disables auto if both F/R set).")
-    p.add_argument("--trunc-len-r", type=int, default=0,
-                   help="Override trunc-len-r.")
+    p.add_argument("--auto-trunc", action="store_true", help="Auto optimize trunc-len-f/r per run/group.")
+    p.add_argument("--trunc-len-f", type=int, default=0, help="Override trunc-len-f (disables auto if both F/R set).")
+    p.add_argument("--trunc-len-r", type=int, default=0, help="Override trunc-len-r.")
     p.add_argument("--trunc-lower-frac", type=float, default=0.80)
     p.add_argument("--trunc-min-len", type=int, default=50)
     p.add_argument("--trunc-step", type=int, default=10)
@@ -85,16 +77,46 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--chimera-method", type=str, default="consensus")
 
     # Classifier sweep
-    p.add_argument("--classifiers-dir", type=Path, default=None,
-                   help="Directory of sklearn classifier .qza files (if omitted, skip sweep).")
+    p.add_argument("--classifiers-dir", type=Path, default=None, help="Directory of sklearn classifier .qza files.")
+
+    # Filtering (NEW; sensible defaults mirror Microbiome Helper notes)
+    p.add_argument("--filter", dest="do_filter", action="store_true",
+                   help="Enable table filtering: rare ASVs, contaminants, low-depth samples (default: on).")
+    p.add_argument("--no-filter", dest="do_filter", action="store_false", help="Disable filtering stage.")
+    p.set_defaults(do_filter=True)
+
+    p.add_argument("--rare-freq-frac", type=float, default=0.001,
+                   help="Min ASV frequency = fraction of mean sample depth (e.g., 0.001 = 0.1%).")
+    p.add_argument("--rare-min-samples", type=int, default=1, help="Keep features present in ≥ this many samples.")
+    p.add_argument("--contam-exclude", type=str, default="mitochondria,chloroplast",
+                   help="Comma list to exclude as contaminants (taxonomy contains any of these).")
+    p.add_argument("--filter-unclassified-phylum", action="store_true",
+                   help="Keep only features with 'p__' in taxonomy (phylum-level classified). Off by default.")
+    p.add_argument("--min-sample-depth", type=int, default=0,
+                   help="Drop samples with total counts < this value after filtering (0 = keep all).")
 
     # Core metrics (phylogeny & diversity)
-    p.add_argument("--retain-fraction", type=float, default=0.90,
-                   help="Fraction of samples to retain when choosing depth.")
-    p.add_argument("--min-depth", type=int, default=1000,
-                   help="Minimum sampling depth.")
-    p.add_argument("--alpha-tsv", action="store_true",
-                   help="Also write <group>/core-metrics-phylo/alpha-metrics.tsv.")
+    p.add_argument("--retain-fraction", type=float, default=0.90, help="Fraction of samples to retain when choosing depth.")
+    p.add_argument("--min-depth", type=int, default=1000, help="Minimum sampling depth.")
+    p.add_argument("--alpha-tsv", action="store_true", help="Also write <group>/core-metrics-phylo/alpha-metrics.tsv.")
+
+    # Stats (optional)
+    p.add_argument("--run-stats", action="store_true",
+                   help="Run diversity stats after core metrics (alpha-group-significance, alpha-correlation, beta-group-significance, ADONIS).")
+    p.add_argument("--beta-group-cols", type=str, default=None,
+                   help="Comma-separated categorical metadata columns for beta-group-significance (e.g., 'primer_group,treatment').")
+    p.add_argument("--beta-method", choices=("permanova", "anosim", "permdisp"), default="permanova")
+    p.add_argument("--pairwise", action="store_true", help="Pairwise tests for beta-group-significance.")
+    p.add_argument("--permutations", type=int, default=999)
+    p.add_argument("--adonis-formula", type=str, default=None,
+                   help='Optional ADONIS formula, e.g., "treatment+block" or "treatment*block".')
+
+    # Taxa barplot toggle (default ON)
+    p.add_argument("--taxa-barplot", dest="taxa_barplot", action="store_true",
+                   help="If taxonomy.qza is available, render taxa-barplot.qzv (default: on).")
+    p.add_argument("--no-taxa-barplot", dest="taxa_barplot", action="store_false",
+                   help="Disable taxa barplot generation.")
+    p.set_defaults(taxa_barplot=True)
 
     p.set_defaults(func=run)
 
@@ -137,11 +159,11 @@ def _stage_three(
     show_qiime: bool,
     retain_fraction: float,
     min_depth: int,
-    alpha_tsv: bool = False
+    alpha_tsv: bool = False,
+    taxa_barplot: bool = True,
 ) -> None:
     """Run phylogeny + core metrics via the shared implementation (resume-safe)."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Idempotent staging into expected filenames inside out_dir
     if rep_seqs and rep_seqs.exists():
         _stage_artifact(rep_seqs, out_dir / "rep-seqs.qza")
     if table and table.exists():
@@ -157,6 +179,7 @@ def _stage_three(
         if_exists="skip",
         dry_run=dry_run,
         show_qiime=show_qiime,
+        make_taxa_barplot=taxa_barplot,
     )
     LOG.info("Core metrics done → %s", core_dir)
     if alpha_tsv:
@@ -231,10 +254,8 @@ def run(args) -> None:
         print(f"error: metadata file not found: {meta_path} (use --init-metadata first)", file=sys.stderr)
         sys.exit(2)
 
-    # Stage 1-2: denoise + merge unless skipped / already present
-    merged_index: Dict[str, dict]
+    # Stage 1-2: denoise + merge unless skipped
     merged_index_path = project_dir / "MERGED.json"
-
     if args.resume and merged_index_path.exists():
         LOG.info("Resume: MERGED.json found, skipping denoise/merge.")
         args.skip_denoise = True
@@ -285,7 +306,7 @@ def run(args) -> None:
         print("error: no matching groups found to operate on.", file=sys.stderr)
         sys.exit(4)
 
-    # Stage 3: classifier sweep
+    # Stage 3: classifier sweep (optional)
     winners: dict[str, dict] = {}
     classifiers_ok = (args.classifiers_dir and Path(args.classifiers_dir).is_dir())
 
@@ -321,7 +342,7 @@ def run(args) -> None:
         print(f"[ok] auto-run (skipped metrics) → {project_dir}")
         return
 
-    # Stage 4: phylogeny + core metrics (resume-aware, and robust staging)
+    # Stage 4: filtering (NEW) → then phylogeny + core metrics (+ optional stats)
     meta_aug = project_dir / "metadata.augmented.tsv"
     for group_key in sorted(selected):
         rec = merged_index[group_key]
@@ -333,14 +354,52 @@ def run(args) -> None:
         if (group_key in winners) and winners[group_key].get("classifier_tag"):
             tag = winners[group_key]["classifier_tag"]
             taxonomy = group_dir / "classifiers" / f"{tag}_classification.qza"
+        elif (group_dir / "taxonomy.qza").exists():
+            taxonomy = group_dir / "taxonomy.qza"
 
+        # Ensure we have a summary for thresholding
+        table_qzv = group_dir / "table.qzv"
+        if not table_qzv.exists():
+            from qs.qiime import commands as qiime
+            qiime.feature_table_summarize(
+                input_table=table,
+                output=table_qzv,
+                sample_metadata_file=meta_aug,
+                dry_run=getattr(args, "dry_run", False),
+                show_stdout=getattr(args, "show_qiime", True),
+            )
+
+        if args.do_filter:
+            min_freq = compute_min_freq_from_qzv(table_qzv, args.rare_freq_frac, fallback_min=1)
+            f = filter_table_and_seqs(
+                group_dir=group_dir,
+                table_qza=table,
+                rep_seqs_qza=rep_seqs,
+                table_qzv=table_qzv,
+                taxonomy_qza=taxonomy,
+                min_freq=min_freq,
+                min_samples=args.rare_min_samples,
+                contam_exclude=args.contam_exclude,
+                keep_only_phylum_classified=args.filter_unclassified_phylum,
+                min_sample_depth=args.min_sample_depth,
+                metadata_augmented=meta_aug,
+                dry_run=getattr(args, "dry_run", False),
+                show_qiime=getattr(args, "show_qiime", True),
+            )
+            # Stage filtered artifacts for metrics
+            table_for_metrics = f["table_final"]
+            rep_for_metrics = f["rep_seqs_final"]
+        else:
+            table_for_metrics = table
+            rep_for_metrics = rep_seqs
+
+        # If resuming and metrics already exist, still ensure barplot/exports
         if args.resume and (group_dir / "core-metrics-phylo").exists():
-            LOG.info("Resume: core-metrics present for group=%s; skipping.", group_key)
-            continue
+            LOG.info("Resume: core-metrics present for group=%s; ensuring barplot/alpha exports.", group_key)
 
         _stage_three(
-            rep_seqs=rep_seqs,
-            table=table,
+            rep_seqs=rep_for_metrics,
+            table=table_for_metrics,
             taxonomy=taxonomy,
             meta_aug=meta_aug,
             out_dir=group_dir,
@@ -348,7 +407,23 @@ def run(args) -> None:
             show_qiime=getattr(args, "show_qiime", True),
             retain_fraction=args.retain_fraction,
             min_depth=args.min_depth,
-            alpha_tsv=getattr(args, "alpha_tsv", False)
+            alpha_tsv=getattr(args, "alpha_tsv", False),
+            taxa_barplot=getattr(args, "taxa_barplot", True),
+        )
+
+        if args.run_starts if False else args.run_stats:  # safeguard older configs; prefer args.run_stats
+            cols = [c.strip() for c in (args.beta_group_cols.split(",") if args.beta_group_cols else []) if c.strip()]
+            run_diversity_stats_for_group(
+                group_dir=group_dir,
+                metadata_file=meta_aug,
+                beta_group_cols=cols,
+                beta_method=args.beta_method,
+                pairwise=args.pairwise,
+                permutations=args.permutations,
+                adonis_formula=args.adonis_formula,
+                run_alpha_correlation=True,
+                dry_run=getattr(args, "dry_run", False),
+                show_qiime=getattr(args, "show_qiime", True),
             )
 
     print(f"[ok] auto-run complete → {project_dir}")

@@ -115,8 +115,8 @@ def dada2_denoise_paired(
         "--p-max-ee-r", str(max_ee_r),
         "--p-trunc-q", str(trunc_q),
         "--p-min-overlap", str(min_overlap),
-        "--p-pooling-method", pooling_method,
-        "--p-chimera-method", chimera_method,
+        "--p-pooling-method", str(pooling_method),
+        "--p-chimera-method", str(chimera_method),
         "--p-n-threads", str(n_threads),
         "--o-table", str(output_table),
         "--o-representative-sequences", str(output_rep_seqs),
@@ -193,7 +193,87 @@ def merge_seqs(
 
 
 # ---------------------------
-# Classification (memory-safe defaults)
+# Filtering (NEW)
+# ---------------------------
+
+def feature_table_filter_features(
+    *,
+    input_table: Path,
+    output_table: Path,
+    min_frequency: int = 0,
+    min_samples: int = 1,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd = [
+        "qiime", "feature-table", "filter-features",
+        "--i-table", str(input_table),
+        "--o-filtered-table", str(output_table),
+        "--p-min-frequency", str(int(min_frequency)),
+        "--p-min-samples", str(int(min_samples)),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def taxa_filter_table(
+    *,
+    input_table: Path,
+    input_taxonomy: Path,
+    output_table: Path,
+    include: Optional[str] = None,
+    exclude: Optional[str] = None,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd = [
+        "qiime", "taxa", "filter-table",
+        "--i-table", str(input_table),
+        "--i-taxonomy", str(input_taxonomy),
+        "--o-filtered-table", str(output_table),
+    ]
+    if include:
+        cmd += ["--p-include", include]
+    if exclude:
+        cmd += ["--p-exclude", exclude]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def feature_table_filter_samples(
+    *,
+    input_table: Path,
+    output_table: Path,
+    min_frequency: int,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd = [
+        "qiime", "feature-table", "filter-samples",
+        "--i-table", str(input_table),
+        "--o-filtered-table", str(output_table),
+        "--p-min-frequency", str(int(min_frequency)),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def feature_table_filter_seqs(
+    *,
+    input_data: Path,
+    input_table: Path,
+    output_data: Path,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd = [
+        "qiime", "feature-table", "filter-seqs",
+        "--i-data", str(input_data),
+        "--i-table", str(input_table),
+        "--o-filtered-data", str(output_data),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+# ---------------------------
+# Classification
 # ---------------------------
 
 def classify_sklearn(
@@ -201,19 +281,15 @@ def classify_sklearn(
     input_reads: Path,
     input_classifier: Path,
     output_classification: Path,
-    reads_per_batch: Union[str, int] = 1000,  # safer default than 'auto'
-    n_jobs: int = 1,                           # safer default than 0 (all cores)
-    pre_dispatch: Optional[str] = None,        # default to '1*n_jobs'
+    reads_per_batch: Union[str, int] = 1000,
+    n_jobs: int = 1,
+    pre_dispatch: Optional[str] = None,
     confidence: float = 0.7,
     read_orientation: str = "auto",
     dry_run: bool = False,
     show_stdout: bool = False,
     extra_env: Optional[Mapping[str, str]] = None,
 ) -> None:
-    """
-    Memory-safer wrapper for sklearn classifier.
-    Set n_jobs small, reads_per_batch small, and pin BLAS threads via extra_env.
-    """
     if pre_dispatch is None:
         pre_dispatch = "1*n_jobs"
     cmd: list[str] = [
@@ -272,5 +348,116 @@ def diversity_core_metrics_phylogenetic(
         "--p-sampling-depth", str(sampling_depth),
         "--m-metadata-file", str(metadata_file),
         "--output-dir", str(output_dir),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+# ---------------------------
+# Taxonomy visuals & stats
+# ---------------------------
+
+def taxa_barplot(
+    *,
+    input_table: Path,
+    input_taxonomy: Path,
+    metadata_file: Path,
+    output_visualization: Path,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd: list[str] = [
+        "qiime", "taxa", "barplot",
+        "--i-table", str(input_table),
+        "--i-taxonomy", str(input_taxonomy),
+        "--m-metadata-file", str(metadata_file),
+        "--o-visualization", str(output_visualization),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def diversity_alpha_group_significance(
+    *,
+    alpha_diversity: Path,
+    metadata_file: Path,
+    output_visualization: Path,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd = [
+        "qiime", "diversity", "alpha-group-significance",
+        "--i-alpha-diversity", str(alpha_diversity),
+        "--m-metadata-file", str(metadata_file),
+        "--o-visualization", str(output_visualization),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def diversity_alpha_correlation(
+    *,
+    alpha_diversity: Path,
+    metadata_file: Path,
+    output_visualization: Path,
+    method: str = "spearman",
+    intersect_ids: bool = False,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd = [
+        "qiime", "diversity", "alpha-correlation",
+        "--i-alpha-diversity", str(alpha_diversity),
+        "--m-metadata-file", str(metadata_file),
+        "--p-method", method,
+        "--o-visualization", str(output_visualization),
+    ]
+    if intersect_ids:
+        cmd.append("--p-intersect-ids")
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def diversity_beta_group_significance(
+    *,
+    distance_matrix: Path,
+    metadata_file: Path,
+    metadata_column: str,
+    output_visualization: Path,
+    method: str = "permanova",
+    permutations: int = 999,
+    pairwise: bool = False,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd = [
+        "qiime", "diversity", "beta-group-significance",
+        "--i-distance-matrix", str(distance_matrix),
+        "--m-metadata-file", str(metadata_file),
+        "--m-metadata-column", metadata_column,
+        "--p-method", method,
+        "--p-permutations", str(permutations),
+        "--o-visualization", str(output_visualization),
+    ]
+    if pairwise:
+        cmd.append("--p-pairwise")
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def diversity_adonis(
+    *,
+    distance_matrix: Path,
+    metadata_file: Path,
+    formula: str,
+    output_visualization: Path,
+    permutations: int = 999,
+    n_jobs: int = 1,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd = [
+        "qiime", "diversity", "adonis",
+        "--i-distance-matrix", str(distance_matrix),
+        "--m-metadata-file", str(metadata_file),
+        "--p-formula", formula,
+        "--p-permutations", str(permutations),
+        "--p-n-jobs", str(n_jobs),
+        "--o-visualization", str(output_visualization),
     ]
     run_command(cmd, dry_run=dry_run, capture=not show_stdout)

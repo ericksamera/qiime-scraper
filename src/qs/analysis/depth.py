@@ -3,8 +3,45 @@ from __future__ import annotations
 
 import json
 import re
+import statistics
 import zipfile
 from pathlib import Path
+from typing import List
+
+
+def _extract_sample_frequencies(table_qzv: Path) -> List[int]:
+    """
+    Parse the feature-table summary .qzv and return per-sample frequencies.
+    Robust to minor HTML changes; falls back to [] on errors.
+    """
+    if not table_qzv.exists():
+        return []
+    try:
+        with zipfile.ZipFile(table_qzv) as z:
+            html = z.read(
+                next(p for p in z.namelist() if p.endswith("sample-frequency-detail.html"))
+            ).decode()
+    except Exception:
+        return []
+    m = re.search(r'id=["\\\']table-data["\\\'][^>]*>\s*(\{.*?\})\s*<', html)
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+        freqs = list(map(int, (data.get("Frequency", {}) or {}).values()))
+        return freqs
+    except Exception:
+        return []
+
+
+def mean_sample_depth(table_qzv: Path) -> int:
+    """
+    Integer mean of per-sample depths from a .qzv; 0 on failure.
+    """
+    freqs = _extract_sample_frequencies(table_qzv)
+    if not freqs:
+        return 0
+    return int(round(statistics.mean(freqs)))
 
 
 def choose_sampling_depth(
@@ -13,29 +50,11 @@ def choose_sampling_depth(
     min_depth: int = 1000,
 ) -> int:
     """
-    Parse a feature-table summary .qzv to choose a depth retaining ~retain_fraction of samples.
-    Falls back to min_depth on parse errors.
+    Choose a rarefaction depth that retains ~retain_fraction of samples,
+    but never less than min_depth.
     """
-    if not table_qzv.exists():
-        return min_depth
-    try:
-        with zipfile.ZipFile(table_qzv) as z:
-            # QIIME's HTML holds a JSON blob in sample-frequency-detail.html
-            html = z.read(
-                next(p for p in z.namelist() if p.endswith("sample-frequency-detail.html"))
-            ).decode()
-    except Exception:
-        return min_depth
-
-    m = re.search(r'id=["\\\']table-data["\\\'][^>]*>\s*(\{.*?\})\s*<', html)
-    if not m:
-        return min_depth
-    try:
-        data = json.loads(m.group(1))
-        freqs = sorted(map(int, (data.get("Frequency", {}) or {}).values()))
-        if not freqs:
-            return min_depth
-    except Exception:
+    freqs = sorted(_extract_sample_frequencies(table_qzv))
+    if not freqs:
         return min_depth
     k = int((1.0 - retain_fraction) * len(freqs))
     k = max(0, min(k, len(freqs) - 1))
