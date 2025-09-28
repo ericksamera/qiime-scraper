@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, Optional, Set
+from typing import Dict, Optional, Set, Any
 
 from qs.utils.logger import get_logger
 from qs.utils.samples import discover_fastqs, paired_sample_ids
@@ -16,12 +16,36 @@ from qs.commands import classify_sweep as cmd_cls
 from qs.analysis.metrics import stage_and_run_metrics_for_group
 from qs.analysis.staging import _stage_artifact
 from qs.analysis.filtering import compute_min_freq_from_qzv, filter_table_and_seqs
-from qs.analysis.depth import mean_sample_depth
 from qs.analysis.stats import run_diversity_stats_for_group
 from qs.utils.text import slugify
 
 LOG = get_logger("auto")
 
+# Defaults snapshot used to decide whether a CLI value was left at default
+_DEFAULTS: Dict[str, Any] = {
+    # selection / resume
+    "groups": None, "skip_denoise": False, "skip_classify": False, "skip_metrics": False, "resume": False,
+    # denoise knobs
+    "split_by_primer_group": False, "discard_untrimmed": False, "no_indels": False, "cores": 0,
+    # auto-truncation
+    "auto_trunc": False, "trunc_len_f": 0, "trunc_len_r": 0, "trunc_lower_frac": 0.80,
+    "trunc_min_len": 50, "trunc_step": 10, "trunc_refine_step": 5, "trunc_quick_learn": 250000,
+    # dada2 misc
+    "trim_left_f": 0, "trim_left_r": 0, "max_ee_f": 2, "max_ee_r": 2, "trunc_q": 2, "min_overlap": 12,
+    "pooling_method": "independent", "chimera_method": "consensus",
+    # classify
+    "classifiers_dir": None,
+    # filtering
+    "do_filter": True, "rare_freq_frac": 0.001, "rare_min_samples": 1,
+    "contam_exclude": "mitochondria,chloroplast", "filter_unclassified_phylum": False, "min_sample_depth": 0,
+    # metrics
+    "retain_fraction": 0.90, "min_depth": 1000, "alpha_tsv": False, "taxa_barplot": True,
+    # stats
+    "run_stats": False, "beta_group_cols": None, "beta_method": "permanova", "pairwise": False, "permutations": 999,
+    "adonis_formula": None,
+    # display
+    "dry_run": False, "show_qiime": True,
+}
 
 def setup_parser(subparsers, parent) -> None:
     p = subparsers.add_parser(
@@ -32,16 +56,29 @@ def setup_parser(subparsers, parent) -> None:
             "→ classifier sweep → filtering → core metrics (+optional stats)."
         ),
     )
-    # Init / inputs
+
+    # Inputs (project-dir now optional; default derived from fastq-dir)
     p.add_argument("--fastq-dir", type=Path, required=True, help="Top FASTQ directory; subfolders are runs.")
-    p.add_argument("--project-dir", type=Path, required=True, help="Project directory (outputs).")
+    p.add_argument("--project-dir", type=Path, default=None,
+                   help="Project directory (default: <fastq-parent>/<fastq-name>-qs).")
     p.add_argument("--metadata-file", type=Path, default=None,
-                   help="Metadata TSV (with primers). If missing and --init-metadata is set, will be generated.")
+                   help="Metadata TSV (default: <project-dir>/metadata.tsv).")
+    p.add_argument("--params", type=Path, default=None,
+                   help="YAML/JSON file with parameter defaults to avoid many CLI flags.")
+    p.add_argument("--auto-init", dest="auto_init", action="store_true",
+                   help="If metadata.tsv is missing, create it and continue (default).")
+    p.add_argument("--no-auto-init", dest="auto_init", action="store_false",
+                   help="Do not auto-create metadata; require it to exist.")
+    p.set_defaults(auto_init=True)
+
+    # Optional one-shot metadata initialization then exit (unchanged)
     p.add_argument("--init-metadata", action="store_true",
                    help="Generate metadata and a top-level manifest, then stop so you can fill primers.")
+
     p.add_argument("--protected-cols", type=str, default="__f_primer,__r_primer",
-                   help="Protected columns for metadata template (used with --init-metadata).")
-    p.add_argument("--keep-illumina-suffix", action="store_true", help="Keep _S#/_L### tokens in SampleIDs (default: strip).")
+                   help="Protected columns for metadata template (used with --init-metadata/--auto-init).")
+    p.add_argument("--keep-illumina-suffix", action="store_true",
+                   help="Keep _S#/_L### tokens in SampleIDs (default: strip).")
     p.add_argument("--id-regex", type=str, default=None, help="Optional regex to derive SampleID (named 'id' or group 1).")
 
     # Stage skipping / resume / selection
@@ -66,6 +103,7 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--trunc-step", type=int, default=10)
     p.add_argument("--trunc-refine-step", type=int, default=5)
     p.add_argument("--trunc-quick-learn", type=int, default=250000)
+
     # DADA2 misc (forwarded)
     p.add_argument("--trim-left-f", type=int, default=0)
     p.add_argument("--trim-left-r", type=int, default=0)
@@ -79,14 +117,14 @@ def setup_parser(subparsers, parent) -> None:
     # Classifier sweep
     p.add_argument("--classifiers-dir", type=Path, default=None, help="Directory of sklearn classifier .qza files.")
 
-    # Filtering (NEW; sensible defaults mirror Microbiome Helper notes)
+    # Filtering (default ON). NOTE: escape % in help string to avoid argparse crash.
     p.add_argument("--filter", dest="do_filter", action="store_true",
                    help="Enable table filtering: rare ASVs, contaminants, low-depth samples (default: on).")
     p.add_argument("--no-filter", dest="do_filter", action="store_false", help="Disable filtering stage.")
     p.set_defaults(do_filter=True)
 
     p.add_argument("--rare-freq-frac", type=float, default=0.001,
-                   help="Min ASV frequency = fraction of mean sample depth (e.g., 0.001 = 0.1%).")
+                   help="Min ASV frequency = fraction of mean sample depth (e.g., 0.001 = 0.1%%).")
     p.add_argument("--rare-min-samples", type=int, default=1, help="Keep features present in ≥ this many samples.")
     p.add_argument("--contam-exclude", type=str, default="mitochondria,chloroplast",
                    help="Comma list to exclude as contaminants (taxonomy contains any of these).")
@@ -121,16 +159,22 @@ def setup_parser(subparsers, parent) -> None:
     p.set_defaults(func=run)
 
 
-def _init_and_exit(
+def _derive_default_project_dir(fastq_dir: Path) -> Path:
+    fd = fastq_dir.resolve()
+    return fd.parent / f"{fd.name}-qs"
+
+
+def _generate_metadata_and_manifest(
     *,
     fastq_dir: Path,
     project_dir: Path,
-    metadata_file: Optional[Path],
+    metadata_file: Path,
     protected_cols: str,
     keep_illumina_suffix: bool,
     id_regex: Optional[str],
 ) -> None:
-    meta_path = metadata_file or (project_dir / "metadata.tsv")
+    """Create metadata.tsv and a top-level manifest; do not exit."""
+    meta_path = metadata_file
     sids = paired_sample_ids(
         discover_fastqs(fastq_dir),
         strip_illumina_suffix=not keep_illumina_suffix,
@@ -142,53 +186,84 @@ def _init_and_exit(
     write_metadata_template(sids, meta_path, [c.strip() for c in protected_cols.split(",") if c.strip()])
     top_manifest = project_dir / "fastq.manifest"
     generate_manifest(fastq_dir, top_manifest, strip_illumina_suffix=not keep_illumina_suffix, id_regex=id_regex)
-    LOG.info("Initialized metadata → %s", meta_path)
-    LOG.info("Top-level manifest → %s", top_manifest)
+    LOG.info("[auto-init] Metadata → %s", meta_path)
+    LOG.info("[auto-init] Top-level manifest → %s", top_manifest)
+
+
+def _init_and_exit(
+    *,
+    fastq_dir: Path,
+    project_dir: Path,
+    metadata_file: Optional[Path],
+    protected_cols: str,
+    keep_illumina_suffix: bool,
+    id_regex: Optional[str],
+) -> None:
+    meta_path = metadata_file or (project_dir / "metadata.tsv")
+    _generate_metadata_and_manifest(
+        fastq_dir=fastq_dir,
+        project_dir=project_dir,
+        metadata_file=meta_path,
+        protected_cols=protected_cols,
+        keep_illumina_suffix=keep_illumina_suffix,
+        id_regex=id_regex,
+    )
     print(f"[ok] Wrote metadata + manifest. Fill primers, then re-run without --init-metadata.")
     sys.exit(0)
 
 
-def _stage_three(
-    rep_seqs: Path,
-    table: Path,
-    taxonomy: Optional[Path],
-    meta_aug: Path,
-    out_dir: Path,
-    *,
-    dry_run: bool,
-    show_qiime: bool,
-    retain_fraction: float,
-    min_depth: int,
-    alpha_tsv: bool = False,
-    taxa_barplot: bool = True,
-) -> None:
-    """Run phylogeny + core metrics via the shared implementation (resume-safe)."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    if rep_seqs and rep_seqs.exists():
-        _stage_artifact(rep_seqs, out_dir / "rep-seqs.qza")
-    if table and table.exists():
-        _stage_artifact(table, out_dir / "table.qza")
-    if taxonomy and taxonomy.exists():
-        _stage_artifact(taxonomy, out_dir / "taxonomy.qza")
+def _load_params_file(path: Path) -> Dict[str, Any]:
+    text = path.read_text()
+    # try YAML first; fall back to JSON if PyYAML is unavailable
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(text)
+    except Exception:
+        data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError("Params file must contain a mapping/object at the top level.")
+    return data
 
-    core_dir = stage_and_run_metrics_for_group(
-        group_dir=out_dir,
-        metadata_augmented=meta_aug,
-        retain_fraction=retain_fraction,
-        min_depth=min_depth,
-        if_exists="skip",
-        dry_run=dry_run,
-        show_qiime=show_qiime,
-        make_taxa_barplot=taxa_barplot,
-    )
-    LOG.info("Core metrics done → %s", core_dir)
-    if alpha_tsv:
-        from qs.analysis.metrics import write_alpha_metrics_tsv
-        try:
-            path = write_alpha_metrics_tsv(out_dir / "core-metrics-phylo")
-            LOG.info("Alpha metrics → %s", path)
-        except Exception as e:
-            LOG.warning("Alpha TSV export skipped: %s", e)
+
+def _flatten(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Allow nested blocks like {denoise:{cores:8}} by flattening one level."""
+    flat: Dict[str, Any] = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            for k2, v2 in v.items():
+                flat[k2] = v2
+        else:
+            flat[k] = v
+    return flat
+
+
+def _apply_params_defaults(args, params: Dict[str, Any]) -> None:
+    """
+    Apply values from params **only where the CLI value is still at its default**.
+    CLI always wins; params just save typing.
+    """
+    flat = _flatten(params)
+
+    # Accept list or comma string for these keys
+    def _norm_cols(x: Any) -> Optional[str]:
+        if x is None:
+            return None
+        if isinstance(x, (list, tuple)):
+            return ",".join(map(str, x))
+        return str(x)
+
+    if "beta_group_cols" in flat:
+        flat["beta_group_cols"] = _norm_cols(flat["beta_group_cols"])
+    if "groups" in flat:
+        flat["groups"] = _norm_cols(flat["groups"])
+
+    for name, value in flat.items():
+        if not hasattr(args, name):
+            continue
+        cur = getattr(args, name)
+        default = _DEFAULTS.get(name, None)
+        if cur == default:
+            setattr(args, name, value)
 
 
 def _load_merged_index(project_dir: Path) -> Dict[str, dict]:
@@ -233,9 +308,19 @@ def _winner_if_present(group_dir: Path) -> Optional[str]:
 
 
 def run(args) -> None:
+    # Populate from params file first (but only where CLI stayed at defaults)
+    if getattr(args, "params", None):
+        try:
+            params = _load_params_file(args.params)
+            _apply_params_defaults(args, params)
+            LOG.info("Loaded defaults from params file: %s", args.params)
+        except Exception as e:
+            print(f"error: failed to read params file {args.params}: {e}", file=sys.stderr)
+            sys.exit(2)
+
     fastq_dir: Path = args.fastq_dir
-    project_dir: Path = args.project_dir
-    meta_path: Optional[Path] = args.metadata_file
+    project_dir: Path = args.project_dir or _derive_default_project_dir(fastq_dir)
+    meta_path: Optional[Path] = args.metadata_file or (project_dir / "metadata.tsv")
 
     project_dir.mkdir(parents=True, exist_ok=True)
 
@@ -249,10 +334,20 @@ def run(args) -> None:
             id_regex=args.id_regex,
         )
 
-    meta_path = meta_path or (project_dir / "metadata.tsv")
+    # Auto-init metadata if missing (unless user opted out)
     if not meta_path.exists():
-        print(f"error: metadata file not found: {meta_path} (use --init-metadata first)", file=sys.stderr)
-        sys.exit(2)
+        if args.auto_init:
+            _generate_metadata_and_manifest(
+                fastq_dir=fastq_dir,
+                project_dir=project_dir,
+                metadata_file=meta_path,
+                protected_cols=args.protected_cols,
+                keep_illumina_suffix=args.keep_illumina_suffix,
+                id_regex=args.id_regex,
+            )
+        else:
+            print(f"error: metadata file not found: {meta_path} (use --init-metadata or enable --auto-init)", file=sys.stderr)
+            sys.exit(2)
 
     # Stage 1-2: denoise + merge unless skipped
     merged_index_path = project_dir / "MERGED.json"
@@ -317,32 +412,31 @@ def run(args) -> None:
 
         if args.skip_classify or not classifiers_ok:
             LOG.info("Skipping classification for group=%s", group_key)
-            continue
+        else:
+            if args.resume:
+                prior = _winner_if_present(group_dir)
+                if prior:
+                    LOG.info("Resume: winner already present for group=%s (%s); skipping sweep.", group_key, prior)
+                    winners[group_key] = {"classifier_tag": prior, "priority": "resume"}
+                    continue
 
-        if args.resume:
-            prior = _winner_if_present(group_dir)
-            if prior:
-                LOG.info("Resume: winner already present for group=%s (%s); skipping sweep.", group_key, prior)
-                winners[group_key] = {"classifier_tag": prior, "priority": "resume"}
-                continue
-
-        cls_out = group_dir / "classifiers"
-        res = cmd_cls.sweep_and_pick(
-            input_reads=rep_seqs,
-            classifiers_dir=Path(args.classifiers_dir),  # type: ignore[arg-type]
-            out_dir=cls_out,
-            dry_run=getattr(args, "dry_run", False),
-            show_qiime=getattr(args, "show_qiime", True),
-        )
-        winners[group_key] = res
-        print(f"[ok] group={group_key} classifier winner={res['classifier_tag']} by {res['priority']}")
+            cls_out = group_dir / "classifiers"
+            res = cmd_cls.sweep_and_pick(
+                input_reads=rep_seqs,
+                classifiers_dir=Path(args.classifiers_dir),  # type: ignore[arg-type]
+                out_dir=cls_out,
+                dry_run=getattr(args, "dry_run", False),
+                show_qiime=getattr(args, "show_qiime", True),
+            )
+            winners[group_key] = res
+            print(f"[ok] group={group_key} classifier winner={res['classifier_tag']} by {res['priority']}")
 
     if args.skip_metrics:
         LOG.info("Skipping core metrics per user request.")
         print(f"[ok] auto-run (skipped metrics) → {project_dir}")
         return
 
-    # Stage 4: filtering (NEW) → then phylogeny + core metrics (+ optional stats)
+    # Stage 4: filtering → phylogeny + core metrics (+ optional stats)
     meta_aug = project_dir / "metadata.augmented.tsv"
     for group_key in sorted(selected):
         rec = merged_index[group_key]
@@ -386,32 +480,24 @@ def run(args) -> None:
                 dry_run=getattr(args, "dry_run", False),
                 show_qiime=getattr(args, "show_qiime", True),
             )
-            # Stage filtered artifacts for metrics
             table_for_metrics = f["table_final"]
             rep_for_metrics = f["rep_seqs_final"]
         else:
             table_for_metrics = table
             rep_for_metrics = rep_seqs
 
-        # If resuming and metrics already exist, still ensure barplot/exports
-        if args.resume and (group_dir / "core-metrics-phylo").exists():
-            LOG.info("Resume: core-metrics present for group=%s; ensuring barplot/alpha exports.", group_key)
-
-        _stage_three(
-            rep_seqs=rep_for_metrics,
-            table=table_for_metrics,
-            taxonomy=taxonomy,
-            meta_aug=meta_aug,
-            out_dir=group_dir,
-            dry_run=getattr(args, "dry_run", False),
-            show_qiime=getattr(args, "show_qiime", True),
+        core_dir = stage_and_run_metrics_for_group(
+            group_dir=group_dir,
+            metadata_augmented=meta_aug,
             retain_fraction=args.retain_fraction,
             min_depth=args.min_depth,
-            alpha_tsv=getattr(args, "alpha_tsv", False),
-            taxa_barplot=getattr(args, "taxa_barplot", True),
+            if_exists="skip",
+            dry_run=getattr(args, "dry_run", False),
+            show_qiime=getattr(args, "show_qiime", True),
+            make_taxa_barplot=getattr(args, "taxa_barplot", True),
         )
 
-        if args.run_starts if False else args.run_stats:  # safeguard older configs; prefer args.run_stats
+        if args.run_stats:
             cols = [c.strip() for c in (args.beta_group_cols.split(",") if args.beta_group_cols else []) if c.strip()]
             run_diversity_stats_for_group(
                 group_dir=group_dir,
@@ -425,5 +511,15 @@ def run(args) -> None:
                 dry_run=getattr(args, "dry_run", False),
                 show_qiime=getattr(args, "show_qiime", True),
             )
+
+        if getattr(args, "alpha_tsv", False):
+            from qs.analysis.metrics import write_alpha_metrics_tsv
+            try:
+                path = write_alpha_metrics_tsv(core_dir)
+                LOG.info("Alpha metrics → %s", path)
+            except Exception as e:
+                LOG.warning("Alpha TSV export skipped: %s", e)
+
+        LOG.info("Group %s → %s", group_key, core_dir)
 
     print(f"[ok] auto-run complete → {project_dir}")
