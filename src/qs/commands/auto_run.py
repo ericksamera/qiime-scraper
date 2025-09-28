@@ -26,7 +26,7 @@ _DEFAULTS: Dict[str, Any] = {
     # selection / resume
     "groups": None, "skip_denoise": False, "skip_classify": False, "skip_metrics": False, "resume": False,
     # denoise knobs
-    "split_by_primer_group": False, "discard_untrimmed": False, "no_indels": False, "cores": 0,
+    "split_by_primer_group": True, "discard_untrimmed": False, "no_indels": False, "cores": 0,
     # auto-truncation
     "auto_trunc": False, "trunc_len_f": 0, "trunc_len_r": 0, "trunc_lower_frac": 0.80,
     "trunc_min_len": 50, "trunc_step": 10, "trunc_refine_step": 5, "trunc_quick_learn": 250000,
@@ -89,7 +89,12 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--groups", type=str, default=None, help="Comma-separated group keys or slugs to operate on (default: all).")
 
     # Denoise knobs (forwarded)
-    p.add_argument("--split-by-primer-group", action="store_true", help="Per primer group within each run.")
+    p.add_argument("--split-by-primer-group", dest="split_by_primer_group", action="store_true",
+                   help="Per primer group within each run (default: on).")
+    p.add_argument("--no-split-by-primer-group", dest="split_by_primer_group", action="store_false",
+                   help="Process all primer pairs together as a single group ('all').")
+    p.set_defaults(split_by_primer_group=True)
+
     p.add_argument("--discard-untrimmed", action="store_true", help="cutadapt: discard reads without primer.")
     p.add_argument("--no-indels", action="store_true", help="cutadapt: exact matches only.")
     p.add_argument("--cores", type=int, default=0, help="Cores for cutadapt & DADA2.")
@@ -173,7 +178,6 @@ def _generate_metadata_and_manifest(
     keep_illumina_suffix: bool,
     id_regex: Optional[str],
 ) -> None:
-    """Create metadata.tsv and a top-level manifest; do not exit."""
     meta_path = metadata_file
     sids = paired_sample_ids(
         discover_fastqs(fastq_dir),
@@ -214,7 +218,6 @@ def _init_and_exit(
 
 def _load_params_file(path: Path) -> Dict[str, Any]:
     text = path.read_text()
-    # try YAML first; fall back to JSON if PyYAML is unavailable
     try:
         import yaml  # type: ignore
         data = yaml.safe_load(text)
@@ -226,7 +229,6 @@ def _load_params_file(path: Path) -> Dict[str, Any]:
 
 
 def _flatten(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Allow nested blocks like {denoise:{cores:8}} by flattening one level."""
     flat: Dict[str, Any] = {}
     for k, v in d.items():
         if isinstance(v, dict):
@@ -238,13 +240,7 @@ def _flatten(d: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _apply_params_defaults(args, params: Dict[str, Any]) -> None:
-    """
-    Apply values from params **only where the CLI value is still at its default**.
-    CLI always wins; params just save typing.
-    """
     flat = _flatten(params)
-
-    # Accept list or comma string for these keys
     def _norm_cols(x: Any) -> Optional[str]:
         if x is None:
             return None
@@ -308,7 +304,6 @@ def _winner_if_present(group_dir: Path) -> Optional[str]:
 
 
 def run(args) -> None:
-    # Populate from params file first (but only where CLI stayed at defaults)
     if getattr(args, "params", None):
         try:
             params = _load_params_file(args.params)
@@ -334,7 +329,6 @@ def run(args) -> None:
             id_regex=args.id_regex,
         )
 
-    # Auto-init metadata if missing (unless user opted out)
     if not meta_path.exists():
         if args.auto_init:
             _generate_metadata_and_manifest(
@@ -349,7 +343,6 @@ def run(args) -> None:
             print(f"error: metadata file not found: {meta_path} (use --init-metadata or enable --auto-init)", file=sys.stderr)
             sys.exit(2)
 
-    # Stage 1-2: denoise + merge unless skipped
     merged_index_path = project_dir / "MERGED.json"
     if args.resume and merged_index_path.exists():
         LOG.info("Resume: MERGED.json found, skipping denoise/merge.")
@@ -451,7 +444,6 @@ def run(args) -> None:
         elif (group_dir / "taxonomy.qza").exists():
             taxonomy = group_dir / "taxonomy.qza"
 
-        # Ensure we have a summary for thresholding
         table_qzv = group_dir / "table.qzv"
         if not table_qzv.exists():
             from qs.qiime import commands as qiime
@@ -480,12 +472,7 @@ def run(args) -> None:
                 dry_run=getattr(args, "dry_run", False),
                 show_qiime=getattr(args, "show_qiime", True),
             )
-            table_for_metrics = f["table_final"]
-            rep_for_metrics = f["rep_seqs_final"]
-        else:
-            table_for_metrics = table
-            rep_for_metrics = rep_seqs
-
+            # metrics stage will now prefer *_final.qza if present (see metrics.py)
         core_dir = stage_and_run_metrics_for_group(
             group_dir=group_dir,
             metadata_augmented=meta_aug,

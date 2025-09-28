@@ -27,21 +27,27 @@ def stage_and_run_metrics_for_group(
     make_taxa_barplot: bool = True,
 ) -> Path:
     """
-    Ensure rep-seqs.qza & table.qza exist in group_dir (repair if needed),
+    Ensure rep-seqs/table exist in group_dir (prefer filtered *_final.qza if present),
     optionally emit taxa-barplot if taxonomy.qza is present,
     then build phylogeny and run core metrics.
     """
     group_dir.mkdir(parents=True, exist_ok=True)
     slug = group_dir.name
 
-    rep_src = group_dir / "rep-seqs.qza"
-    tbl_src = group_dir / "table.qza"
+    # Prefer filtered artifacts when present
+    rep_src = group_dir / "rep_seqs_final.qza"
+    if not rep_src.exists():
+        rep_src = group_dir / "rep-seqs.qza"
+    tbl_src = group_dir / "table_final.qza"
+    if not tbl_src.exists():
+        tbl_src = group_dir / "table.qza"
 
     if (not rep_src.exists()) or _is_broken_symlink(rep_src):
         _repair_rep_seqs(slug, group_dir, rep_src, dry_run=dry_run, show_qiime=show_qiime)
     if (not tbl_src.exists()) or _is_broken_symlink(tbl_src):
         _repair_table(slug, group_dir, tbl_src, dry_run=dry_run, show_qiime=show_qiime)
 
+    # Stage to canonical names used by downstream steps
     _stage_artifact(rep_src, group_dir / "rep-seqs.qza")
     _stage_artifact(tbl_src, group_dir / "table.qza")
 
@@ -107,10 +113,6 @@ def stage_and_run_metrics_for_group(
 
 
 def write_alpha_metrics_tsv(core_metrics_dir: Path, out_tsv: Optional[Path] = None) -> Path:
-    """
-    Merge core-metrics alpha vectors into a single TSV with columns:
-    sample-id, observed_features, evenness, faith_pd, shannon
-    """
     alpha_qzas = {
         "observed_features": core_metrics_dir / "observed_features_vector.qza",
         "evenness":          core_metrics_dir / "evenness_vector.qza",

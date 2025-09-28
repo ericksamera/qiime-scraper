@@ -24,7 +24,7 @@ def setup_parser(subparsers, parent) -> None:
         help="Per-run (and per primer-group) import → cutadapt → DADA2 → merge.",
         description=(
             "Detect runs from subfolders of --fastq-dir. Add a 'run' column to metadata. "
-            "Optionally split each run by primer pair (from metadata columns). "
+            "By default, split each run by primer pair (from metadata columns) so each locus is processed independently. "
             "Run cutadapt and DADA2 per run(/group), then merge across runs per primer-group."
         ),
     )
@@ -39,8 +39,11 @@ def setup_parser(subparsers, parent) -> None:
     # Primer columns & grouping
     p.add_argument("--front-f-col", type=str, default="__f_primer", help="Metadata column with forward primers.")
     p.add_argument("--front-r-col", type=str, default="__r_primer", help="Metadata column with reverse primers.")
-    p.add_argument("--split-by-primer-group", action="store_true",
-                   help="Process each primer pair as its own sub-pipeline per run (recommended for mixed loci).")
+    p.add_argument("--split-by-primer-group", dest="split_by_primer_group", action="store_true",
+                   help="Process each primer pair as its own sub-pipeline per run (default: on).")
+    p.add_argument("--no-split-by-primer-group", dest="split_by_primer_group", action="store_false",
+                   help="Process all samples (primer pairs) together as a single group.")
+    p.set_defaults(split_by_primer_group=True)
 
     # cutadapt knobs
     p.add_argument("--cores", type=int, default=0, help="Cores for cutadapt and DADA2.")
@@ -102,10 +105,6 @@ def _auto_or_fixed_trunc(
     fwd_list: List[str],
     rev_list: List[str],
 ) -> Tuple[int, int, Dict[str, object]]:
-    """
-    Decide trunc-len-f/r. If --auto-trunc, run optimizer with primer-aware upper bounds.
-    Returns (f, r, opt_result_dict_or_empty).
-    """
     # If user provided both trunc lens explicitly, respect them.
     if not args.auto_trunc and (args.trunc_len_f > 0 and args.trunc_len_r > 0):
         return args.trunc_len_f, args.trunc_len_r, {}
