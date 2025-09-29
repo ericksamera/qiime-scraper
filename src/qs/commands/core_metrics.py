@@ -53,7 +53,7 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--adonis-formula", type=str, default=None)
 
     # Taxa barplot toggle
-    p.add_argument("--taxa-barplot", dest="taxa_barplot", action="true", help="Render taxa-barplot.qzv if taxonomy exists.")
+    p.add_argument("--taxa-barplot", dest="taxa_barplot", action="store_true", help="Render taxa-barplot.qzv if taxonomy exists.")
     p.add_argument("--no-taxa-barplot", dest="taxa_barplot", action="store_false")
     p.set_defaults(taxa_barplot=True)
 
