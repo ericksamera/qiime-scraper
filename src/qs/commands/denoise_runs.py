@@ -16,6 +16,7 @@ from qs.metadata.augment import augment_metadata_with_runs_and_groups
 from qs.qiime import commands as qiime
 from qs.optimize.truncation import find_optimal_truncation
 from qs.primers.detect import detect_primers_for_samples
+from qs.primers.grouping import canonicalize_primer_pairs
 
 LOG = get_logger("denoise")
 
@@ -26,8 +27,8 @@ def setup_parser(subparsers, parent) -> None:
         help="Per-run (and per primer-group) import → cutadapt → DADA2 → merge.",
         description=(
             "Detect runs from subfolders of --fastq-dir. Add a 'run' column to metadata. "
-            "By default, split each run by primer pair (from metadata columns or auto-detection). "
-            "Run cutadapt and DADA2 per run(/group), then merge across runs per primer-group."
+            "By default, split each run by primer pair. Now indel/mismatch tolerant: "
+            "near-identical primer pairs collapse into one group."
         ),
     )
     p.add_argument("--fastq-dir", type=Path, required=True, help="Top directory of FASTQs. Subfolders are treated as runs.")
@@ -38,7 +39,7 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--keep-illumina-suffix", action="store_true", help="Keep _S#/_L### tokens (default: strip).")
     p.add_argument("--id-regex", type=str, default=None, help="Optional regex to extract SampleID (named 'id' or group 1).")
 
-    # Primer grouping toggle (default ON) + auto-detect fallback
+    # Primer grouping & detection
     p.add_argument("--split-by-primer-group", dest="split_by_primer_group", action="store_true",
                    help="Process each primer pair as its own sub-pipeline per run (default: on).")
     p.add_argument("--no-split-by-primer-group", dest="split_by_primer_group", action="store_false",
@@ -53,6 +54,10 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--scan-kmin", type=int, default=16)
     p.add_argument("--scan-kmax", type=int, default=24)
     p.add_argument("--scan-min-frac", type=float, default=0.30)
+
+    # New: tolerate tiny indel/mismatch differences when grouping
+    p.add_argument("--group-edit-max", type=int, default=1,
+                   help="Collapse primer pairs that differ by ≤ this many edits (IUPAC-aware). 0 = exact only.")
 
     # cutadapt knobs
     p.add_argument("--cores", type=int, default=0, help="Cores for cutadapt and DADA2.")
@@ -92,12 +97,13 @@ def _collect_group_primers(rows: List[dict], f_col: str, r_col: str) -> Dict[str
     for r in rows:
         f = (r.get(f_col) or "").strip()
         rv = (r.get(r_col) or "").strip()
-        key = _group_key(f, rv)
+        key = (r.get("primer_group") or _group_key(f, rv)).strip()
         by_group.setdefault(key, (set(), set()))
         if f:
             by_group[key][0].add(f)
         if rv:
             by_group[key][1].add(rv)
+    # drop empties
     return {k: (sorted(v[0]), sorted(v[1])) for k, v in by_group.items() if k}
 
 
@@ -114,11 +120,9 @@ def _auto_or_fixed_trunc(
     fwd_list: List[str],
     rev_list: List[str],
 ) -> Tuple[int, int, Dict[str, object]]:
-    # If user provided both trunc lens explicitly, respect them.
     if not args.auto_trunc and (args.trunc_len_f > 0 and args.trunc_len_r > 0):
         return args.trunc_len_f, args.trunc_len_r, {}
 
-    # Auto mode — compute primer-length reductions (use shortest per side).
     red_f = min((len(p) for p in fwd_list), default=0)
     red_r = min((len(p) for p in rev_list), default=0)
 
@@ -150,61 +154,75 @@ def _auto_or_fixed_trunc(
     return int(best["trunc_len_f"]), int(best["trunc_len_r"]), result  # type: ignore[index]
 
 
-def _autofill_augmented_metadata(
+def _autofill_and_normalize_groups(
     *,
     meta_aug: Path,
     fastq_dir: Path,
-    sample_ids: List[str],
     id_regex: Optional[str],
-    strip_illumina_suffix: bool,
+    keep_illumina_suffix: bool,
     kmin: int,
     kmax: int,
     max_reads: int,
     min_frac: float,
+    group_edit_max: int,
 ) -> None:
     """
-    If primer columns are blank, fill them using detection and recompute primer_group.
+    1) Fill missing __f_primer / __r_primer from FASTQs (if requested).
+    2) Collapse near-identical primer pairs into canonical consensus groups (IUPAC-aware).
+    Rewrite 'primer_group' accordingly.
     """
     header, rows = load_metadata_table(meta_aug)
+
+    # Build per-sample pairs
     need_fill = any(
         not (r.get("__f_primer") or "").strip() or not (r.get("__r_primer") or "").strip()
         for r in rows
     )
-    if not need_fill:
-        return
+    if need_fill:
+        sids = [(r.get("#SampleID") or "").lstrip("#") for r in rows if (r.get("#SampleID") or "").strip()]
+        detected = detect_primers_for_samples(
+            fastq_dir,
+            sids,
+            strip_illumina_suffix=not keep_illumina_suffix,
+            id_regex=id_regex,
+            kmin=kmin, kmax=kmax, max_reads=max_reads, min_fraction=min_frac,
+        )
+        for r in rows:
+            sid = (r.get("#SampleID") or "").lstrip("#")
+            if sid in detected:
+                f, rv = detected[sid]
+                if not (r.get("__f_primer") or "").strip():
+                    r["__f_primer"] = f
+                if not (r.get("__r_primer") or "").strip():
+                    r["__r_primer"] = rv
 
-    detected = detect_primers_for_samples(
-        fastq_dir,
-        sample_ids,
-        strip_illumina_suffix=strip_illumina_suffix,
-        id_regex=id_regex,
-        kmin=kmin, kmax=kmax, max_reads=max_reads, min_fraction=min_frac,
-    )
-
-    if "__f_primer" not in header:
-        header.append("__f_primer")
-    if "__r_primer" not in header:
-        header.append("__r_primer")
-    if "primer_group" not in header:
-        header.append("primer_group")
-
+    # Canonicalize groups (indel/mismatch tolerant)
+    per: Dict[str, Tuple[str, str]] = {}
     for r in rows:
         sid = (r.get("#SampleID") or "").lstrip("#")
-        if sid in detected:
-            f, rv = detected[sid]
-            if not (r.get("__f_primer") or "").strip():
-                r["__f_primer"] = f
-            if not (r.get("__r_primer") or "").strip():
-                r["__r_primer"] = rv
         f = (r.get("__f_primer") or "").strip()
-        b = (r.get("__r_primer") or "").strip()
-        r["primer_group"] = f"{f}|{b}" if (f and b) else (r.get("primer_group") or "")
+        rv = (r.get("__r_primer") or "").strip()
+        if sid and f and rv:
+            per[sid] = (f, rv)
 
-    with meta_aug.open("w", encoding="utf-8", newline="") as fh:
-        w = csv.writer(fh, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
-        w.writerow(header)
+    if per:
+        groups_map, sample_to_key, _variants, _clusters = canonicalize_primer_pairs(
+            per, max_edits=max(0, int(group_edit_max))
+        )
+        # ensure header contains primer_group
+        if "primer_group" not in header:
+            header.append("primer_group")
         for r in rows:
-            w.writerow([r.get(col, "") for col in header])
+            sid = (r.get("#SampleID") or "").lstrip("#")
+            if sid in sample_to_key:
+                r["primer_group"] = sample_to_key[sid]
+
+        # write back
+        with meta_aug.open("w", encoding="utf-8", newline="") as fh:
+            w = csv.writer(fh, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
+            w.writerow(header)
+            for r in rows:
+                w.writerow([r.get(col, "") for col in header])
 
 
 def run(args) -> None:
@@ -244,21 +262,18 @@ def run(args) -> None:
     )
     LOG.info("Wrote augmented metadata → %s", meta_aug)
 
-    # Optional: fill missing primers by scanning FASTQs, then recompute primer_group values.
-    if args.auto_detect_primers:
-        _, all_rows_for_fill = load_metadata_table(meta_aug)
-        sids_for_fill = [ (r.get("#SampleID") or "").lstrip("#") for r in all_rows_for_fill if (r.get("#SampleID") or "").strip() ]
-        _autofill_augmented_metadata(
-            meta_aug=meta_aug,
-            fastq_dir=fastq_dir,
-            sample_ids=sids_for_fill,
-            id_regex=args.id_regex,
-            strip_illumina_suffix=not args.keep_illumina_suffix,
-            kmin=args.scan_kmin,
-            kmax=args.scan_kmax,
-            max_reads=args.scan_max_reads,
-            min_frac=args.scan_min_frac,
-        )
+    # NEW: normalize primer groups (IUPAC/indel tolerant)
+    _autofill_and_normalize_groups(
+        meta_aug=meta_aug,
+        fastq_dir=fastq_dir,
+        id_regex=args.id_regex,
+        keep_illumina_suffix=args.keep_illumina_suffix,
+        kmin=args.scan_kmin,
+        kmax=args.scan_kmax,
+        max_reads=args.scan_max_reads,
+        min_frac=args.scan_min_frac,
+        group_edit_max=args.group_edit_max,
+    )
 
     per_group_tables: Dict[str, List[Path]] = {}
     per_group_seqs: Dict[str, List[Path]] = {}
@@ -282,7 +297,7 @@ def run(args) -> None:
                 _ensure_dir(sub_root)
 
                 group_sids = [r.get("#SampleID") or r.get("sample-id") for r in run_rows
-                              if f"{(r.get('__f_primer') or '').strip()}|{(r.get('__r_primer') or '').strip()}" == gkey]
+                              if (r.get("primer_group") or _group_key((r.get('__f_primer') or '').strip(), (r.get('__r_primer') or '').strip())) == gkey]
                 group_sids = [s.lstrip("#") for s in group_sids if s]
 
                 sub_manifest = sub_root / "fastq.manifest"
@@ -354,7 +369,7 @@ def run(args) -> None:
                 per_group_seqs.setdefault(gkey or "all", []).append(seqs_qza)
 
         else:
-            # No split
+            # Single combined analysis
             fset, rset = set(), set()
             for r in run_rows:
                 f = (r.get("__f_primer") or "").strip()

@@ -9,7 +9,8 @@ from qs.utils.logger import get_logger
 from qs.utils.samples import discover_fastqs, paired_sample_ids
 from qs.metadata import DEFAULT_PROTECTED_COLS
 from qs.metadata.template import write_metadata_with_primers, write_metadata_template
-from qs.primers.detect import detect_groups_for_samples
+from qs.primers.detect import detect_primers_for_samples
+from qs.primers.grouping import canonicalize_primer_pairs
 from qs.primers import degen
 from qs.utils.text import slugify
 from qs.config.io import write_params_and_plan
@@ -37,6 +38,10 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--scan-kmax", type=int, default=24)
     p.add_argument("--scan-min-frac", type=float, default=0.30)
 
+    # Indel/mismatch tolerant grouping
+    p.add_argument("--group-edit-max", type=int, default=1,
+                   help="Collapse primer pairs that differ by ≤ this many edits (IUPAC-aware). 0 = exact only.")
+
     # YAML expansion limit
     p.add_argument("--expand-limit", type=int, default=64)
 
@@ -52,21 +57,17 @@ def _parse_protected(s: str) -> List[str]:
     cols = [c.strip() for c in s.split(",") if c.strip()]
     return cols or list(DEFAULT_PROTECTED_COLS)
 
-def _primer_group_summaries(
-    groups: Dict[str, List[str]],
-    per_sample: Dict[str, Tuple[str, str]],
-    expand_limit: int,
+def _summaries_from_clusters(
+    clusters, expand_limit: int
 ) -> List[Dict[str, object]]:
     out: List[Dict[str, object]] = []
-    for key, sids in sorted(groups.items()):
-        fvars = {per_sample[s][0] for s in sids if s in per_sample}
-        rvars = {per_sample[s][1] for s in sids if s in per_sample}
-        fsum = degen.summarize_variants(sorted(fvars), expand_limit=expand_limit)
-        rsum = degen.summarize_variants(sorted(rvars), expand_limit=expand_limit)
+    for c in clusters:
+        fsum = degen.summarize_variants(c.fwd_variants, expand_limit=expand_limit)
+        rsum = degen.summarize_variants(c.rev_variants, expand_limit=expand_limit)
         out.append({
-            "group_key": key,
-            "group_slug": slugify(key if key else "all"),
-            "n_samples": len(sids),
+            "group_key": c.key,
+            "group_slug": c.slug,
+            "n_samples": len(c.samples),
             "forward": fsum,
             "reverse": rsum,
         })
@@ -92,29 +93,35 @@ def run(args) -> None:
         print("error: no paired R1/R2 FASTQs detected; check filenames.", file=sys.stderr)
         sys.exit(4)
 
+    # 1) Detect primers per sample
     groups: Dict[str, List[str]] = {}
     per_sample: Dict[str, Tuple[str, str]] = {}
-
     if args.auto_detect_primers:
-        groups, per_sample = detect_groups_for_samples(
+        per_sample = detect_primers_for_samples(
             fastq_dir, sample_ids,
             strip_illumina_suffix=strip, id_regex=args.id_regex,
             kmin=args.scan_kmin, kmax=args.scan_kmax, max_reads=args.scan_max_reads, min_fraction=args.scan_min_frac,
         )
         LOG.info("Primer detection: confident calls for %d/%d samples.", len(per_sample), len(sample_ids))
 
-    # Write metadata
+    # 2) Write metadata (filled if possible)
     if per_sample:
         write_metadata_with_primers(sample_ids, meta_out, per_sample, _parse_protected(args.protected_cols))
     else:
         write_metadata_template(sample_ids, meta_out, _parse_protected(args.protected_cols))
     print(f"[ok] metadata → {meta_out}")
 
-    # Write params + plan (robust, typed schema on read)
+    # 3) Build INDDEL-tolerant groups + params plan
     if args.emit_params:
         params_path = args.params_file or (meta_out.parent / "params.yaml")
 
-        # defaults snapshot aligned with auto-run
+        if per_sample:
+            groups, sample_to_key, per_group_variants, clusters = canonicalize_primer_pairs(
+                per_sample, max_edits=max(0, int(args.group_edit_max))
+            )
+        else:
+            groups, clusters = {}, []
+
         params = {
             "resume": True,
             "split_by_primer_group": (len([k for k in groups if k]) > 1),
@@ -132,12 +139,13 @@ def run(args) -> None:
             "run_stats": False, "beta_group_cols": ["primer_group"], "beta_method": "permanova", "pairwise": False,
             "permutations": 999, "adonis_formula": None,
             "show_qiime": True,
-            # NEW knobs:
+            # Per-group classifier map scaffold
             "classifiers_map": { (slugify(k) if k else "all"): None for k in groups } | {"default": None},
+            # Canonical IUPAC consensus per group (what trimming expects at the start of reads)
             "primer_pairs": {
                 (slugify(k) if k else "all"): {
-                    "forward_iupac": degen.summarize_variants([k.split("|")[0]], expand_limit=args.expand_limit)["consensus_iupac"] if k else "",
-                    "reverse_iupac": degen.summarize_variants([k.split("|")[1]], expand_limit=args.expand_limit)["consensus_iupac"] if k and "|" in k else "",
+                    "forward_iupac": k.split("|", 1)[0] if k else "",
+                    "reverse_iupac": k.split("|", 1)[1] if (k and "|" in k) else "",
                 } for k in groups
             },
         }
@@ -145,10 +153,10 @@ def run(args) -> None:
         plan = {
             "generated": datetime.utcnow().isoformat(timespec="seconds") + "Z",
             "detected_groups_n": len([k for k in groups if k]),
-            "primer_pairs": _primer_group_summaries(groups, per_sample, args.expand_limit),
+            "primer_pairs": _summaries_from_clusters(clusters, args.expand_limit),
             "detected_primers_per_sample": per_sample,
             "suggested_command": "qs auto-run --fastq-dir <FASTQ_DIR> --params " + params_path.name,
-            "notes": "Set params.classifiers_map per primer group slug to either a directory (sweep) or a single .qza classifier (fixed).",
+            "notes": f"Primer groups were clustered with IUPAC-aware edit distance ≤ {max(0, int(args.group_edit_max))}.",
         }
 
         write_params_and_plan(params_path, params, plan)
