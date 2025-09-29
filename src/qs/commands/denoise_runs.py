@@ -5,6 +5,7 @@ import csv
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Tuple
 
 from qs.utils.logger import get_logger
@@ -25,29 +26,19 @@ def setup_parser(subparsers, parent) -> None:
     p = subparsers.add_parser(
         "denoise-runs", parents=[parent],
         help="Per-run (and per primer-group) import → cutadapt → DADA2 → merge.",
-        description=(
-            "Detect runs from subfolders of --fastq-dir. Add a 'run' column to metadata. "
-            "By default, split each run by primer pair. Now indel/mismatch tolerant: "
-            "near-identical primer pairs collapse into one group."
-        ),
     )
-    p.add_argument("--fastq-dir", type=Path, required=True, help="Top directory of FASTQs. Subfolders are treated as runs.")
-    p.add_argument("--project-dir", type=Path, required=True, help="Project output directory.")
-    p.add_argument("--metadata-file", type=Path, required=True, help="Metadata TSV (with primer columns).")
+    p.add_argument("--fastq-dir", type=Path, required=True)
+    p.add_argument("--project-dir", type=Path, required=True)
+    p.add_argument("--metadata-file", type=Path, required=True)
 
-    # ID normalization
-    p.add_argument("--keep-illumina-suffix", action="store_true", help="Keep _S#/_L### tokens (default: strip).")
-    p.add_argument("--id-regex", type=str, default=None, help="Optional regex to extract SampleID (named 'id' or group 1).")
+    p.add_argument("--keep-illumina-suffix", action="store_true")
+    p.add_argument("--id-regex", type=str, default=None)
 
-    # Primer grouping & detection
-    p.add_argument("--split-by-primer-group", dest="split_by_primer_group", action="store_true",
-                   help="Process each primer pair as its own sub-pipeline per run (default: on).")
-    p.add_argument("--no-split-by-primer-group", dest="split_by_primer_group", action="store_false",
-                   help="Process all samples together as a single group.")
+    p.add_argument("--split-by-primer-group", dest="split_by_primer_group", action="store_true")
+    p.add_argument("--no-split-by-primer-group", dest="split_by_primer_group", action="store_false")
     p.set_defaults(split_by_primer_group=True)
 
-    p.add_argument("--auto-detect-primers", dest="auto_detect_primers", action="store_true",
-                   help="If primer columns are empty, quickly scan FASTQs to infer __f_primer/__r_primer per sample (default: on).")
+    p.add_argument("--auto-detect-primers", dest="auto_detect_primers", action="store_true")
     p.add_argument("--no-auto-detect-primers", dest="auto_detect_primers", action="store_false")
     p.set_defaults(auto_detect_primers=True)
     p.add_argument("--scan-max-reads", type=int, default=4000)
@@ -55,42 +46,43 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--scan-kmax", type=int, default=24)
     p.add_argument("--scan-min-frac", type=float, default=0.30)
 
-    # New: tolerate tiny indel/mismatch differences when grouping
+    # NEW: grouping tolerance (IUPAC-aware edit distance)
     p.add_argument("--group-edit-max", type=int, default=1,
                    help="Collapse primer pairs that differ by ≤ this many edits (IUPAC-aware). 0 = exact only.")
 
-    # cutadapt knobs
-    p.add_argument("--cores", type=int, default=0, help="Cores for cutadapt and DADA2.")
-    p.add_argument("--discard-untrimmed", action="store_true", help="cutadapt: --p-discard-untrimmed")
-    p.add_argument("--no-indels", action="store_true", help="cutadapt: --p-no-indels")
+    # cutadapt / dada2
+    p.add_argument("--cores", type=int, default=0)
+    p.add_argument("--discard-untrimmed", action="store_true")
+    p.add_argument("--no-indels", action="store_true")
 
-    # DADA2 fixed or auto truncation
-    p.add_argument("--trunc-len-f", type=int, default=0, help="DADA2 --p-trunc-len-f (override auto if set).")
-    p.add_argument("--trunc-len-r", type=int, default=0, help="DADA2 --p-trunc-len-r (override auto if set).")
-    p.add_argument("--auto-trunc", action="store_true",
-                   help="Automatically choose trunc-len-f/r via coarse-to-fine optimization.")
-    p.add_argument("--trunc-lower-frac", type=float, default=0.80, help="Lower bound as fraction of (post-trim) read length.")
-    p.add_argument("--trunc-min-len", type=int, default=50, help="Absolute minimum trunc length bound.")
-    p.add_argument("--trunc-step", type=int, default=10, help="Coarse step size in bp (default 10).")
-    p.add_argument("--trunc-refine-step", type=int, default=5, help="Refine step size in bp (default 5).")
-    p.add_argument("--trunc-quick-learn", type=int, default=250000, help="n-reads-learn for optimization trials.")
+    p.add_argument("--trunc-len-f", type=int, default=0)
+    p.add_argument("--trunc-len-r", type=int, default=0)
+    p.add_argument("--auto-trunc", action="store_true")
+    p.add_argument("--trunc-lower-frac", type=float, default=0.80)
+    p.add_argument("--trunc-min-len", type=int, default=50)
+    p.add_argument("--trunc-step", type=int, default=10)
+    p.add_argument("--trunc-refine-step", type=int, default=5)
+    p.add_argument("--trunc-quick-learn", type=int, default=250000)
 
-    # DADA2 other knobs
-    p.add_argument("--trim-left-f", type=int, default=0, help="DADA2 --p-trim-left-f")
-    p.add_argument("--trim-left-r", type=int, default=0, help="DADA2 --p-trim-left-r")
-    p.add_argument("--max-ee-f", type=int, default=2, help="DADA2 --p-max-ee-f")
-    p.add_argument("--max-ee-r", type=int, default=2, help="DADA2 --p-max-ee-r")
-    p.add_argument("--trunc-q", type=int, default=2, help="DADA2 --p-trunc-q")
-    p.add_argument("--min-overlap", type=int, default=12, help="DADA2 --p-min-overlap")
-    p.add_argument("--pooling-method", type=str, default="independent", help="DADA2 --p-pooling-method")
-    p.add_argument("--chimera-method", type=str, default="consensus", help="DADA2 --p-chimera-method")
+    p.add_argument("--trim-left-f", type=int, default=0)
+    p.add_argument("--trim-left-r", type=int, default=0)
+    p.add_argument("--max-ee-f", type=int, default=2)
+    p.add_argument("--max-ee-r", type=int, default=2)
+    p.add_argument("--trunc-q", type=int, default=2)
+    p.add_argument("--min-overlap", type=int, default=12)
+    p.add_argument("--pooling-method", type=str, default="independent")
+    p.add_argument("--chimera-method", type=str, default="consensus")
 
     p.set_defaults(func=run)
 
+def _to_ns(args=None, **kwargs) -> SimpleNamespace:
+    """Accept argparse-style positional or kwargs and normalize to a SimpleNamespace."""
+    if args is not None and not isinstance(args, SimpleNamespace):
+        return args  # argparse.Namespace works the same for getattr
+    return SimpleNamespace(**kwargs)
 
 def _group_key(f: str, r: str) -> str:
     return f"{f}|{r}" if f and r else ""
-
 
 def _collect_group_primers(rows: List[dict], f_col: str, r_col: str) -> Dict[str, Tuple[List[str], List[str]]]:
     by_group: Dict[str, Tuple[set, set]] = {}
@@ -103,25 +95,17 @@ def _collect_group_primers(rows: List[dict], f_col: str, r_col: str) -> Dict[str
             by_group[key][0].add(f)
         if rv:
             by_group[key][1].add(rv)
-    # drop empties
     return {k: (sorted(v[0]), sorted(v[1])) for k, v in by_group.items() if k}
-
 
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
-
 def _auto_or_fixed_trunc(
-    *,
-    run_path: Path,
-    sub_root: Path,
-    input_for_dada2: Path,
-    args,
-    fwd_list: List[str],
-    rev_list: List[str],
+    *, run_path: Path, sub_root: Path, input_for_dada2: Path, args,
+    fwd_list: List[str], rev_list: List[str],
 ) -> Tuple[int, int, Dict[str, object]]:
-    if not args.auto_trunc and (args.trunc_len_f > 0 and args.trunc_len_r > 0):
-        return args.trunc_len_f, args.trunc_len_r, {}
+    if not getattr(args, "auto_trunc", False) and (getattr(args, "trunc_len_f", 0) > 0 and getattr(args, "trunc_len_r", 0) > 0):
+        return getattr(args, "trunc_len_f", 0), getattr(args, "trunc_len_r", 0), {}
 
     red_f = min((len(p) for p in fwd_list), default=0)
     red_r = min((len(p) for p in rev_list), default=0)
@@ -131,49 +115,34 @@ def _auto_or_fixed_trunc(
         run_path=run_path,
         input_seqs=input_for_dada2,
         outdir=opt_dir,
-        lower_frac=args.trunc_lower_frac,
-        abs_min_len=args.trunc_min_len,
-        coarse_step=args.trunc_step,
-        refine_step=args.trunc_refine_step,
-        cores=args.cores,
-        quick_learn=args.trunc_quick_learn,
+        lower_frac=getattr(args, "trunc_lower_frac", 0.80),
+        abs_min_len=getattr(args, "trunc_min_len", 50),
+        coarse_step=getattr(args, "trunc_step", 10),
+        refine_step=getattr(args, "trunc_refine_step", 5),
+        cores=getattr(args, "cores", 0),
+        quick_learn=getattr(args, "trunc_quick_learn", 250000),
         dry_run=getattr(args, "dry_run", False),
         show_qiime=getattr(args, "show_qiime", True),
-        trim_left_f=args.trim_left_f,
-        trim_left_r=args.trim_left_r,
-        max_ee_f=args.max_ee_f,
-        max_ee_r=args.max_ee_r,
-        trunc_q=args.trunc_q,
-        min_overlap=args.min_overlap,
-        pooling_method=args.pooling_method,
-        chimera_method=args.chimera_method,
+        trim_left_f=getattr(args, "trim_left_f", 0),
+        trim_left_r=getattr(args, "trim_left_r", 0),
+        max_ee_f=getattr(args, "max_ee_f", 2),
+        max_ee_r=getattr(args, "max_ee_r", 2),
+        trunc_q=getattr(args, "trunc_q", 2),
+        min_overlap=getattr(args, "min_overlap", 12),
+        pooling_method=getattr(args, "pooling_method", "independent"),
+        chimera_method=getattr(args, "chimera_method", "consensus"),
         length_reduction_f=red_f,
         length_reduction_r=red_r,
     )
     best = result["best"]  # type: ignore[index]
     return int(best["trunc_len_f"]), int(best["trunc_len_r"]), result  # type: ignore[index]
 
-
 def _autofill_and_normalize_groups(
-    *,
-    meta_aug: Path,
-    fastq_dir: Path,
-    id_regex: Optional[str],
-    keep_illumina_suffix: bool,
-    kmin: int,
-    kmax: int,
-    max_reads: int,
-    min_frac: float,
-    group_edit_max: int,
+    *, meta_aug: Path, fastq_dir: Path, id_regex: Optional[str], keep_illumina_suffix: bool,
+    kmin: int, kmax: int, max_reads: int, min_frac: float, group_edit_max: int,
 ) -> None:
-    """
-    1) Fill missing __f_primer / __r_primer from FASTQs (if requested).
-    2) Collapse near-identical primer pairs into canonical consensus groups (IUPAC-aware).
-    Rewrite 'primer_group' accordingly.
-    """
     header, rows = load_metadata_table(meta_aug)
 
-    # Build per-sample pairs
     need_fill = any(
         not (r.get("__f_primer") or "").strip() or not (r.get("__r_primer") or "").strip()
         for r in rows
@@ -181,51 +150,43 @@ def _autofill_and_normalize_groups(
     if need_fill:
         sids = [(r.get("#SampleID") or "").lstrip("#") for r in rows if (r.get("#SampleID") or "").strip()]
         detected = detect_primers_for_samples(
-            fastq_dir,
-            sids,
-            strip_illumina_suffix=not keep_illumina_suffix,
-            id_regex=id_regex,
+            fastq_dir, sids, strip_illumina_suffix=not keep_illumina_suffix, id_regex=id_regex,
             kmin=kmin, kmax=kmax, max_reads=max_reads, min_fraction=min_frac,
         )
         for r in rows:
             sid = (r.get("#SampleID") or "").lstrip("#")
             if sid in detected:
                 f, rv = detected[sid]
-                if not (r.get("__f_primer") or "").strip():
-                    r["__f_primer"] = f
-                if not (r.get("__r_primer") or "").strip():
-                    r["__r_primer"] = rv
+                if not (r.get("__f_primer") or "").strip(): r["__f_primer"] = f
+                if not (r.get("__r_primer") or "").strip(): r["__r_primer"] = rv
 
-    # Canonicalize groups (indel/mismatch tolerant)
     per: Dict[str, Tuple[str, str]] = {}
     for r in rows:
         sid = (r.get("#SampleID") or "").lstrip("#")
         f = (r.get("__f_primer") or "").strip()
         rv = (r.get("__r_primer") or "").strip()
-        if sid and f and rv:
-            per[sid] = (f, rv)
+        if sid and f and rv: per[sid] = (f, rv)
 
     if per:
         groups_map, sample_to_key, _variants, _clusters = canonicalize_primer_pairs(
             per, max_edits=max(0, int(group_edit_max))
         )
-        # ensure header contains primer_group
-        if "primer_group" not in header:
-            header.append("primer_group")
+        if "primer_group" not in header: header.append("primer_group")
         for r in rows:
             sid = (r.get("#SampleID") or "").lstrip("#")
             if sid in sample_to_key:
                 r["primer_group"] = sample_to_key[sid]
 
-        # write back
         with meta_aug.open("w", encoding="utf-8", newline="") as fh:
             w = csv.writer(fh, delimiter="\t", lineterminator="\n", quoting=csv.QUOTE_MINIMAL)
             w.writerow(header)
             for r in rows:
                 w.writerow([r.get(col, "") for col in header])
 
+def run(args=None, **kwargs) -> None:
+    # Accept both call styles: func(args) or func(**vars(args))
+    args = _to_ns(args, **kwargs)
 
-def run(args) -> None:
     fastq_dir: Path = args.fastq_dir
     project_dir: Path = args.project_dir
     meta_in: Path = args.metadata_file
@@ -244,35 +205,25 @@ def run(args) -> None:
         _ensure_dir(run_root)
         manifest_path = run_root / "fastq.manifest"
         generate_manifest(
-            run_path,
-            manifest_path,
-            strip_illumina_suffix=not args.keep_illumina_suffix,
-            id_regex=args.id_regex,
+            run_path, manifest_path,
+            strip_illumina_suffix=not getattr(args, "keep_illumina_suffix", False),
+            id_regex=getattr(args, "id_regex", None),
         )
         for sid in read_manifest_sample_ids(manifest_path):
             run_sid_map[sid] = run_id
 
     meta_aug = project_dir / "metadata.augmented.tsv"
-    header, _groups_map = augment_metadata_with_runs_and_groups(
-        meta_in,
-        meta_aug,
-        run_by_sample_id=run_sid_map,
-        f_col="__f_primer",
-        r_col="__r_primer",
+    header, _ = augment_metadata_with_runs_and_groups(
+        meta_in, meta_aug, run_by_sample_id=run_sid_map, f_col="__f_primer", r_col="__r_primer",
     )
     LOG.info("Wrote augmented metadata → %s", meta_aug)
 
-    # NEW: normalize primer groups (IUPAC/indel tolerant)
     _autofill_and_normalize_groups(
-        meta_aug=meta_aug,
-        fastq_dir=fastq_dir,
-        id_regex=args.id_regex,
-        keep_illumina_suffix=args.keep_illumina_suffix,
-        kmin=args.scan_kmin,
-        kmax=args.scan_kmax,
-        max_reads=args.scan_max_reads,
-        min_frac=args.scan_min_frac,
-        group_edit_max=args.group_edit_max,
+        meta_aug=meta_aug, fastq_dir=fastq_dir, id_regex=getattr(args, "id_regex", None),
+        keep_illumina_suffix=getattr(args, "keep_illumina_suffix", False),
+        kmin=getattr(args, "scan_kmin", 16), kmax=getattr(args, "scan_kmax", 24),
+        max_reads=getattr(args, "scan_max_reads", 4000), min_frac=getattr(args, "scan_min_frac", 0.30),
+        group_edit_max=getattr(args, "group_edit_max", 1),
     )
 
     per_group_tables: Dict[str, List[Path]] = {}
@@ -285,7 +236,7 @@ def run(args) -> None:
         run_sids = set(read_manifest_sample_ids(manifest_path))
         run_rows = [r for r in all_rows if (r.get("#SampleID") or r.get("sample-id") or "").lstrip("#") in run_sids]
 
-        if args.split_by_primer_group:
+        if getattr(args, "split_by_primer_group", True):
             group_primers = _collect_group_primers(run_rows, "__f_primer", "__r_primer")
             if not group_primers:
                 LOG.warning("Run %s: no primer groups; processing all together without trimming.", run_id)
@@ -302,67 +253,47 @@ def run(args) -> None:
 
                 sub_manifest = sub_root / "fastq.manifest"
                 generate_manifest(
-                    run_path,
-                    sub_manifest,
-                    strip_illumina_suffix=not args.keep_illumina_suffix,
-                    id_regex=args.id_regex,
+                    run_path, sub_manifest,
+                    strip_illumina_suffix=not getattr(args, "keep_illumina_suffix", False),
+                    id_regex=getattr(args, "id_regex", None),
                     allowed_sample_ids=group_sids if gkey != "all" else None,
                 )
 
                 demux_qza = sub_root / "demux.qza"
                 qiime.import_data(
-                    input_path=sub_manifest,
-                    output_path=demux_qza,
-                    dry_run=getattr(args, "dry_run", False),
-                    show_stdout=getattr(args, "show_qiime", True),
+                    input_path=sub_manifest, output_path=demux_qza,
+                    dry_run=getattr(args, "dry_run", False), show_stdout=getattr(args, "show_qiime", True),
                 )
 
                 trimmed_qza = sub_root / "trimmed.qza"
                 input_for_dada2 = demux_qza
                 if fwd_list and rev_list:
                     qiime.cutadapt_trim_paired(
-                        input_seqs=demux_qza,
-                        forward_primers=fwd_list,
-                        reverse_primers=rev_list,
-                        output_path=trimmed_qza,
-                        cores=args.cores,
-                        discard_untrimmed=args.discard_untrimmed,
-                        no_indels=args.no_indels,
-                        dry_run=getattr(args, "dry_run", False),
-                        show_stdout=getattr(args, "show_qiime", True),
+                        input_seqs=demux_qza, forward_primers=fwd_list, reverse_primers=rev_list, output_path=trimmed_qza,
+                        cores=getattr(args, "cores", 0), discard_untrimmed=getattr(args, "discard_untrimmed", False),
+                        no_indels=getattr(args, "no_indels", False),
+                        dry_run=getattr(args, "dry_run", False), show_stdout=getattr(args, "show_qiime", True),
                     )
                     input_for_dada2 = trimmed_qza
 
                 trunc_f, trunc_r, _ = _auto_or_fixed_trunc(
-                    run_path=run_path,
-                    sub_root=sub_root,
-                    input_for_dada2=input_for_dada2,
-                    args=args,
-                    fwd_list=fwd_list,
-                    rev_list=rev_list,
+                    run_path=run_path, sub_root=sub_root, input_for_dada2=input_for_dada2, args=args,
+                    fwd_list=fwd_list, rev_list=rev_list,
                 )
 
                 table_qza = sub_root / "table.qza"
                 seqs_qza = sub_root / "rep-seqs.qza"
                 stats_qza = sub_root / "dada2-stats.qza"
                 qiime.dada2_denoise_paired(
-                    input_seqs=input_for_dada2,
-                    trunc_len_f=trunc_f,
-                    trunc_len_r=trunc_r,
-                    output_table=table_qza,
-                    output_rep_seqs=seqs_qza,
-                    output_stats=stats_qza,
-                    trim_left_f=args.trim_left_f,
-                    trim_left_r=args.trim_left_r,
-                    max_ee_f=args.max_ee_f,
-                    max_ee_r=args.max_ee_r,
-                    trunc_q=args.trunc_q,
-                    min_overlap=args.min_overlap,
-                    pooling_method=args.pooling_method,
-                    chimera_method=args.chimera_method,
-                    n_threads=args.cores,
-                    dry_run=getattr(args, "dry_run", False),
-                    show_stdout=getattr(args, "show_qiime", True),
+                    input_seqs=input_for_dada2, trunc_len_f=trunc_f, trunc_len_r=trunc_r,
+                    output_table=table_qza, output_rep_seqs=seqs_qza, output_stats=stats_qza,
+                    trim_left_f=getattr(args, "trim_left_f", 0), trim_left_r=getattr(args, "trim_left_r", 0),
+                    max_ee_f=getattr(args, "max_ee_f", 2), max_ee_r=getattr(args, "max_ee_r", 2),
+                    trunc_q=getattr(args, "trunc_q", 2), min_overlap=getattr(args, "min_overlap", 12),
+                    pooling_method=getattr(args, "pooling_method", "independent"),
+                    chimera_method=getattr(args, "chimera_method", "consensus"),
+                    n_threads=getattr(args, "cores", 0),
+                    dry_run=getattr(args, "dry_run", False), show_stdout=getattr(args, "show_qiime", True),
                 )
 
                 per_group_tables.setdefault(gkey or "all", []).append(table_qza)
@@ -380,58 +311,39 @@ def run(args) -> None:
 
             demux_qza = run_root / "demux.qza"
             qiime.import_data(
-                input_path=manifest_path,
-                output_path=demux_qza,
-                dry_run=getattr(args, "dry_run", False),
-                show_stdout=getattr(args, "show_qiime", True),
+                input_path=manifest_path, output_path=demux_qza,
+                dry_run=getattr(args, "dry_run", False), show_stdout=getattr(args, "show_qiime", True),
             )
 
             input_for_dada2 = demux_qza
             if fwd_list and rev_list:
                 trimmed_qza = run_root / "trimmed.qza"
                 qiime.cutadapt_trim_paired(
-                    input_seqs=demux_qza,
-                    forward_primers=fwd_list,
-                    reverse_primers=rev_list,
-                    output_path=trimmed_qza,
-                    cores=args.cores,
-                    discard_untrimmed=args.discard_untrimmed,
-                    no_indels=args.no_indels,
-                    dry_run=getattr(args, "dry_run", False),
-                    show_stdout=getattr(args, "show_qiime", True),
+                    input_seqs=demux_qza, forward_primers=fwd_list, reverse_primers=rev_list, output_path=trimmed_qza,
+                    cores=getattr(args, "cores", 0), discard_untrimmed=getattr(args, "discard_untrimmed", False),
+                    no_indels=getattr(args, "no_indels", False),
+                    dry_run=getattr(args, "dry_run", False), show_stdout=getattr(args, "show_qiime", True),
                 )
                 input_for_dada2 = trimmed_qza
 
             trunc_f, trunc_r, _ = _auto_or_fixed_trunc(
-                run_path=run_path,
-                sub_root=run_root,
-                input_for_dada2=input_for_dada2,
-                args=args,
-                fwd_list=fwd_list,
-                rev_list=rev_list,
+                run_path=run_path, sub_root=run_root, input_for_dada2=input_for_dada2, args=args,
+                fwd_list=fwd_list, rev_list=rev_list,
             )
 
             table_qza = run_root / "table.qza"
             seqs_qza = run_root / "rep-seqs.qza"
             stats_qza = run_root / "dada2-stats.qza"
             qiime.dada2_denoise_paired(
-                input_seqs=input_for_dada2,
-                trunc_len_f=trunc_f,
-                trunc_len_r=trunc_r,
-                output_table=table_qza,
-                output_rep_seqs=seqs_qza,
-                output_stats=stats_qza,
-                trim_left_f=args.trim_left_f,
-                trim_left_r=args.trim_left_r,
-                max_ee_f=args.max_ee_f,
-                max_ee_r=args.max_ee_r,
-                trunc_q=args.trunc_q,
-                min_overlap=args.min_overlap,
-                pooling_method=args.pooling_method,
-                chimera_method=args.chimera_method,
-                n_threads=args.cores,
-                dry_run=getattr(args, "dry_run", False),
-                show_stdout=getattr(args, "show_qiime", True),
+                input_seqs=input_for_dada2, trunc_len_f=trunc_f, trunc_len_r=trunc_r,
+                output_table=table_qza, output_rep_seqs=seqs_qza, output_stats=stats_qza,
+                trim_left_f=getattr(args, "trim_left_f", 0), trim_left_r=getattr(args, "trim_left_r", 0),
+                max_ee_f=getattr(args, "max_ee_f", 2), max_ee_r=getattr(args, "max_ee_r", 2),
+                trunc_q=getattr(args, "trunc_q", 2), min_overlap=getattr(args, "min_overlap", 12),
+                pooling_method=getattr(args, "pooling_method", "independent"),
+                chimera_method=getattr(args, "chimera_method", "consensus"),
+                n_threads=getattr(args, "cores", 0),
+                dry_run=getattr(args, "dry_run", False), show_stdout=getattr(args, "show_qiime", True),
             )
 
             per_group_tables.setdefault("all", []).append(table_qza)
@@ -442,8 +354,8 @@ def run(args) -> None:
     for gkey, tables in per_group_tables.items():
         seqs = per_group_seqs.get(gkey, [])
         gslug = slugify(gkey if gkey else "all")
-        out_root = project_dir / ("groups" if args.split_by_primer_group else ".")
-        if args.split_by_primer_group:
+        out_root = project_dir / ("groups" if getattr(args, "split_by_primer_group", True) else ".")
+        if getattr(args, "split_by_primer_group", True):
             out_root = project_dir / "groups" / gslug
         out_root.mkdir(parents=True, exist_ok=True)
 

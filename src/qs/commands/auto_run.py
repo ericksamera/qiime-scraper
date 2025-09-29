@@ -34,6 +34,8 @@ _DEFAULTS: Dict[str, Any] = {
     "run_stats": False, "beta_group_cols": None, "beta_method": "permanova", "pairwise": False, "permutations": 999,
     "adonis_formula": None,
     "dry_run": False, "show_qiime": True,
+    # NEW default used when forwarding to denoise
+    "group_edit_max": 1,
 }
 
 def setup_parser(subparsers, parent) -> None:
@@ -64,6 +66,7 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--no-split-by-primer-group", dest="split_by_primer_group", action="store_false")
     p.set_defaults(split_by_primer_group=True)
 
+    # Forwarded to cutadapt/DADA2
     p.add_argument("--discard-untrimmed", action="store_true")
     p.add_argument("--no-indels", action="store_true")
     p.add_argument("--cores", type=int, default=0)
@@ -86,9 +89,11 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--pooling-method", type=str, default="independent")
     p.add_argument("--chimera-method", type=str, default="consensus")
 
+    # Classifiers
     p.add_argument("--classifiers-dir", type=Path, default=None)
     p.add_argument("--classifiers-map", type=Path, default=None, help="YAML/JSON mapping slug|key|default -> dir|.qza")
 
+    # Filtering / metrics / stats
     p.add_argument("--filter", dest="do_filter", action="store_true")
     p.add_argument("--no-filter", dest="do_filter", action="store_false")
     p.set_defaults(do_filter=True)
@@ -112,6 +117,10 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--taxa-barplot", dest="taxa_barplot", action="store_true")
     p.add_argument("--no-taxa-barplot", dest="taxa_barplot", action="store_false")
     p.set_defaults(taxa_barplot=True)
+
+    # NEW: expose grouping tolerance here too (forwarded to denoise)
+    p.add_argument("--group-edit-max", type=int, default=_DEFAULTS["group_edit_max"],
+                   help="Collapse primer pairs that differ by ≤ this many edits (IUPAC-aware). 0 = exact only.")
 
     p.set_defaults(func=run)
 
@@ -175,11 +184,21 @@ def _load_mapping_file(path: Path) -> Dict[str, str]:
         return {str(k): str(v) for k, v in data["params"]["classifiers_map"].items() if v is not None}
     return {str(k): str(v) for k, v in data.items() if v is not None}
 
-def run(args) -> None:
-    # params file → typed (robust) + apply defaults to CLI only where at defaults
+def _to_ns(args=None, **kwargs) -> SimpleNamespace:
+    """Accept argparse-style positional or kwargs and normalize to a SimpleNamespace."""
+    if args is not None and not isinstance(args, SimpleNamespace):
+        # Usually argparse.Namespace; that's fine too
+        return args  # type: ignore[return-value]
+    return SimpleNamespace(**kwargs)
+
+def run(args=None, **kwargs) -> None:
+    # Accept both call styles: func(args) or func(**vars(args))
+    args = _to_ns(args, **kwargs)
+
+    # params file → typed + apply to CLI only where at defaults
     params_typed: Optional[Params] = None
     params_map: Optional[Dict[str, Any]] = None
-    if args.params:
+    if getattr(args, "params", None):
         try:
             params_typed, plan = load_params_typed(args.params)
             params_map = (params_typed.model_dump() if params_typed else None)
@@ -193,7 +212,7 @@ def run(args) -> None:
     meta_path: Path = args.metadata_file or (project_dir / "metadata.tsv")
     project_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.init_metadata:
+    if getattr(args, "init_metadata", False):
         _generate_metadata_and_manifest(
             fastq_dir=fastq_dir, project_dir=project_dir, metadata_file=meta_path,
             protected_cols=args.protected_cols, keep_illumina_suffix=args.keep_illumina_suffix, id_regex=args.id_regex,
@@ -202,7 +221,7 @@ def run(args) -> None:
         return
 
     if not meta_path.exists():
-        if args.auto_init:
+        if getattr(args, "auto_init", True):
             _generate_metadata_and_manifest(
                 fastq_dir=fastq_dir, project_dir=project_dir, metadata_file=meta_path,
                 protected_cols=args.protected_cols, keep_illumina_suffix=args.keep_illumina_suffix, id_regex=args.id_regex,
@@ -211,10 +230,10 @@ def run(args) -> None:
             print(f"error: metadata not found: {meta_path}", file=sys.stderr); sys.exit(2)
 
     merged_idx = project_dir / "MERGED.json"
-    if args.resume and merged_idx.exists():
+    if getattr(args, "resume", False) and merged_idx.exists():
         args.skip_denoise = True
 
-    if not args.skip_denoise:
+    if not getattr(args, "skip_denoise", False):
         ns = SimpleNamespace(
             fastq_dir=fastq_dir, project_dir=project_dir, metadata_file=meta_path,
             keep_illumina_suffix=args.keep_illumina_suffix, id_regex=args.id_regex,
@@ -227,8 +246,9 @@ def run(args) -> None:
             trim_left_f=args.trim_left_f, trim_left_r=args.trim_left_r, max_ee_f=args.max_ee_f, max_ee_r=args.max_ee_r,
             trunc_q=args.trunc_q, min_overlap=args.min_overlap, pooling_method=args.pooling_method, chimera_method=args.chimera_method,
             dry_run=getattr(args, "dry_run", False), show_qiime=getattr(args, "show_qiime", True),
-            # primer scan knobs (denoise can auto-fill augmented metadata if blank)
             auto_detect_primers=True, scan_max_reads=4000, scan_kmin=16, scan_kmax=24, scan_min_frac=0.30,
+            # NEW: forward grouping tolerance (default 1 if not supplied)
+            group_edit_max=getattr(args, "group_edit_max", _DEFAULTS["group_edit_max"]),
         )
         cmd_denoise.run(ns)
 
@@ -238,13 +258,13 @@ def run(args) -> None:
         print("error: MERGED.json not found; run denoise or use --resume only with existing project.", file=sys.stderr)
         sys.exit(3)
 
-    selected = _select_groups(merged_index, args.groups)
+    selected = _select_groups(merged_index, getattr(args, "groups", None))
     if not selected:
         print("error: no matching groups found.", file=sys.stderr); sys.exit(4)
 
     # Resolve per-group classifier sources
     classifiers_map: Optional[Dict[str, str]] = None
-    if args.classifiers_map:
+    if getattr(args, "classifiers_map", None):
         try:
             classifiers_map = _load_mapping_file(args.classifiers_map)
         except Exception as e:
@@ -253,13 +273,13 @@ def run(args) -> None:
         classifiers_map = {k: v for k, v in (params_typed.classifiers_map or {}).items() if v}
 
     winners: Dict[str, Dict[str, str]] = {}
-    if not args.skip_classify:
+    if not getattr(args, "skip_classify", False):
         for g in sorted(selected):
             gdir = Path(merged_index[g]["dir"])
             rep = gdir / "rep-seqs.qza"
             slug = slugify(g if g else "all")
 
-            if args.resume:
+            if getattr(args, "resume", False):
                 prior = _winner_if_present(gdir)
                 if prior:
                     winners[g] = {"classifier_tag": prior, "priority": "resume"}
@@ -284,7 +304,7 @@ def run(args) -> None:
             winners[g] = res  # type: ignore[assignment]
             print(f"[ok] group={g} classifier winner={res['classifier_tag']} by {res['priority']}")
 
-    if args.skip_metrics:
+    if getattr(args, "skip_metrics", False):
         print(f"[ok] auto-run (skipped metrics) → {project_dir}"); return
 
     meta_aug = project_dir / "metadata.augmented.tsv"
@@ -306,7 +326,7 @@ def run(args) -> None:
             qiime.feature_table_summarize(table, table_qzv, sample_metadata_file=meta_aug,
                                           dry_run=getattr(args, "dry_run", False), show_stdout=getattr(args, "show_qiime", True))
 
-        if args.do_filter:
+        if getattr(args, "do_filter", True):
             min_freq = compute_min_freq_from_qzv(table_qzv, args.rare_freq_frac, fallback_min=1)
             f = filter_table_and_seqs(
                 group_dir=gdir, table_qza=table, rep_seqs_qza=rep, table_qzv=table_qzv, taxonomy_qza=taxonomy,
@@ -316,13 +336,13 @@ def run(args) -> None:
             )
             table = f["table_final"]; rep = f["rep_seqs_final"]
 
-        core_dir = stage_and_run_metrics_for_group(
+        stage_and_run_metrics_for_group(
             group_dir=gdir, metadata_augmented=meta_aug, retain_fraction=args.retain_fraction, min_depth=args.min_depth,
             if_exists="skip", dry_run=getattr(args, "dry_run", False), show_qiime=getattr(args, "show_qiime", True),
             make_taxa_barplot=getattr(args, "taxa_barplot", True),
         )
 
-        if args.run_stats:
+        if getattr(args, "run_stats", False):
             cols = [c.strip() for c in (args.beta_group_cols.split(",") if args.beta_group_cols else []) if c.strip()]
             run_diversity_stats_for_group(
                 group_dir=gdir, metadata_file=meta_aug,
