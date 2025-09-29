@@ -3,24 +3,20 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 from pydantic import BaseModel, Field, field_validator
 
-# ---- Primer summaries ---------------------------------------------------------
-
 class PrimerSideSummary(BaseModel):
     consensus_iupac: str = ""
     degenerate_bases: List[str] = Field(default_factory=list)
-    expanded_variants: List[str] = Field(default_factory=list)   # may be empty when too many
+    expanded_variants: List[str] = Field(default_factory=list)
     expanded_count: int = 0
     observed_variants_count: int = 0
     observed_variants_example: List[str] = Field(default_factory=list)
 
 class PrimerGroupSummary(BaseModel):
-    group_key: str = ""   # "F|R"
-    group_slug: str = ""  # slug of key
+    group_key: str = ""
+    group_slug: str = ""
     n_samples: int = 0
     forward: PrimerSideSummary = Field(default_factory=PrimerSideSummary)
     reverse: PrimerSideSummary = Field(default_factory=PrimerSideSummary)
-
-# ---- Params + Plan ------------------------------------------------------------
 
 class Params(BaseModel):
     # selection / resume
@@ -78,11 +74,14 @@ class Params(BaseModel):
     # display
     show_qiime: bool = True
 
-    # classification (NEW)
-    classifiers_map: Optional[Dict[str, str | None]] = None   # slug|key|default -> dir/.qza
+    # classification
+    classifiers_map: Optional[Dict[str, str | None]] = None
 
-    # detected primer pairs (NEW – lightweight)
-    primer_pairs: Dict[str, Dict[str, str]] = Field(default_factory=dict)  # slug -> {forward_iupac, reverse_iupac}
+    # detected primer pairs (lightweight)
+    primer_pairs: Dict[str, Dict[str, str]] = Field(default_factory=dict)
+
+    # NEW: grouping tolerance for indel/mismatch-tolerant grouping
+    group_edit_max: int = 1
 
     @field_validator("beta_method")
     @classmethod
@@ -90,7 +89,6 @@ class Params(BaseModel):
         if v not in ("permanova", "anosim", "permdisp"):
             raise ValueError("beta_method must be one of: permanova, anosim, permdisp")
         return v
-
 
 class Plan(BaseModel):
     generated: str

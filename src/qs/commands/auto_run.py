@@ -3,7 +3,7 @@ from __future__ import annotations
 import json, sys
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional
 
 from qs.utils.logger import get_logger
 from qs.utils.samples import discover_fastqs, paired_sample_ids
@@ -14,9 +14,17 @@ from qs.commands import classify_sweep as cmd_cls
 from qs.analysis.metrics import stage_and_run_metrics_for_group
 from qs.analysis.filtering import compute_min_freq_from_qzv, filter_table_and_seqs
 from qs.analysis.stats import run_diversity_stats_for_group
-from qs.utils.text import slugify
 from qs.config.io import load_params_typed, apply_params_defaults
 from qs.config.schema import Params
+from qs.commands.common import (
+    to_ns,
+    ensure_fastq_dir,
+    derive_default_project_dir,
+    load_merged_index,
+    select_groups,
+    winner_if_present,
+    resolve_classifier_source,
+)
 
 LOG = get_logger("auto")
 
@@ -34,7 +42,7 @@ _DEFAULTS: Dict[str, Any] = {
     "run_stats": False, "beta_group_cols": None, "beta_method": "permanova", "pairwise": False, "permutations": 999,
     "adonis_formula": None,
     "dry_run": False, "show_qiime": True,
-    # forward to denoise
+    # grouping tolerance (forwarded to denoise)
     "group_edit_max": 1,
 }
 
@@ -91,8 +99,7 @@ def setup_parser(subparsers, parent) -> None:
 
     # Classifiers
     p.add_argument("--classifiers-dir", type=Path, default=None)
-    p.add_argument("--classifiers-map", type=Path, default=None,
-                   help="YAML/JSON mapping slug|key|default -> dir|.qza")
+    p.add_argument("--classifiers-map", type=Path, default=None, help="YAML/JSON mapping slug|key|default -> dir|.qza")
 
     # Filtering / metrics / stats
     p.add_argument("--filter", dest="do_filter", action="store_true")
@@ -126,139 +133,64 @@ def setup_parser(subparsers, parent) -> None:
     p.set_defaults(func=run)
 
 
-# --- helpers ------------------------------------------------------------------
-
-def _to_ns(args=None, **kwargs) -> SimpleNamespace:
-    """Accept argparse-style positional or kwargs and normalize to a SimpleNamespace."""
-    if args is not None and not isinstance(args, SimpleNamespace):
-        return args  # argparse.Namespace is fine
-    return SimpleNamespace(**kwargs)
-
-def _derive_default_project_dir(fastq_dir: Path) -> Path:
-    fd = fastq_dir.resolve()
-    return fd.parent / f"{fd.name}-qs"
-
-def _ensure_fastq_dir(args) -> Path:
-    """
-    Guarantee we have a Path for fastq_dir.
-    - If present on args, use it.
-    - Else, if ./fastq exists, use that (common case).
-    - Else, fail with a clear message instead of AttributeError.
-    """
-    v = getattr(args, "fastq_dir", None)
-    if isinstance(v, Path):
-        return v
-    if isinstance(v, str) and v:
-        return Path(v)
-    default = Path("fastq")
-    if default.is_dir():
-        return default
-    print("error: --fastq-dir is required and was not found on the invocation. "
-          "Pass it explicitly (e.g., --fastq-dir ./fastq).", file=sys.stderr)
-    sys.exit(2)
-
-def _generate_metadata_and_manifest(*, fastq_dir: Path, project_dir: Path, metadata_file: Path,
-                                    protected_cols: str, keep_illumina_suffix: bool, id_regex: Optional[str]) -> None:
-    sids = paired_sample_ids(
-        discover_fastqs(fastq_dir), strip_illumina_suffix=not keep_illumina_suffix, id_regex=id_regex,
-    )
-    if not sids:
-        print("error: no paired FASTQs discovered; cannot init metadata.", file=sys.stderr)
-        sys.exit(2)
-    write_metadata_template(sids, metadata_file, [c.strip() for c in protected_cols.split(",") if c.strip()])
-    top_manifest = project_dir / "fastq.manifest"
-    generate_manifest(fastq_dir, top_manifest, strip_illumina_suffix=not keep_illumina_suffix, id_regex=id_regex)
-
-def _load_merged_index(project_dir: Path) -> Dict[str, dict]:
-    p = project_dir / "MERGED.json"
-    if not p.exists():
-        raise FileNotFoundError(p)
-    return json.loads(p.read_text())
-
-def _select_groups(idx: Dict[str, dict], groups_arg: Optional[str]) -> Set[str]:
-    if not groups_arg:
-        return set(idx.keys())
-    want = {g.strip() for g in groups_arg.split(",") if g.strip()}
-    slugs = {slugify(k if k else "all"): k for k in idx}
-    out: Set[str] = set()
-    for g in want:
-        if g in idx: out.add(g)
-        elif g in slugs: out.add(slugs[g])
-    return out
-
-def _winner_if_present(group_dir: Path) -> Optional[str]:
-    rpt = group_dir / "classifiers" / "optimal_classifiers.json"
-    if not rpt.exists(): return None
-    try:
-        data = json.loads(rpt.read_text())
-        for k in ("pct_depth≥7", "median_conf", "mean_conf"):
-            picks = data.get("winners", {}).get(k, [])
-            if picks: return str(picks[0]["classifier"])
-    except Exception:
-        return None
-    return None
-
-def _resolve_classifier_source(group_key: str, slug: str, *, mapping: Optional[Dict[str, str]],
-                               fallback_dir: Optional[Path]) -> Optional[Path]:
-    if mapping:
-        for k in (group_key, slug, "default"):
-            v = mapping.get(k)
-            if v: return Path(v)
-    return fallback_dir
-
-def _load_mapping_file(path: Path) -> Dict[str, str]:
-    from qs.config.io import load_params_raw
-    data = load_params_raw(path)
-    if "params" in data and isinstance(data["params"], dict) and isinstance(data["params"].get("classifiers_map"), dict):
-        return {str(k): str(v) for k, v in data["params"]["classifiers_map"].items() if v is not None}
-    return {str(k): str(v) for k, v in data.items() if v is not None}
-
-
-# --- entrypoint ---------------------------------------------------------------
-
 def run(args=None, **kwargs) -> None:
-    # Accept both call styles: func(args) or func(**vars(args))
-    args = _to_ns(args, **kwargs)
+    # Accept both call styles
+    args = to_ns(args, **kwargs)
 
     # params file → typed + apply to CLI only where at defaults
     params_typed: Optional[Params] = None
     params_map: Optional[Dict[str, Any]] = None
     if getattr(args, "params", None):
         try:
-            params_typed, plan = load_params_typed(args.params)
+            params_typed, _ = load_params_typed(args.params)
             params_map = (params_typed.model_dump() if params_typed else None)
             apply_params_defaults(args, params_map or {}, _DEFAULTS)
         except Exception as e:
             print(f"error: reading params {args.params}: {e}", file=sys.stderr)
             sys.exit(2)
 
-    # >>> robustly acquire fastq_dir (prevents AttributeError)
-    fastq_dir: Path = _ensure_fastq_dir(args)
-    project_dir: Path = (args.project_dir or _derive_default_project_dir(fastq_dir))
+    fastq_dir: Path = ensure_fastq_dir(args)
+    project_dir: Path = (args.project_dir or derive_default_project_dir(fastq_dir))
     meta_path: Path = (args.metadata_file or (project_dir / "metadata.tsv"))
     project_dir.mkdir(parents=True, exist_ok=True)
 
     if getattr(args, "init_metadata", False):
-        _generate_metadata_and_manifest(
-            fastq_dir=fastq_dir, project_dir=project_dir, metadata_file=meta_path,
-            protected_cols=args.protected_cols, keep_illumina_suffix=args.keep_illumina_suffix, id_regex=args.id_regex,
+        sids = paired_sample_ids(
+            discover_fastqs(fastq_dir),
+            strip_illumina_suffix=not args.keep_illumina_suffix,
+            id_regex=args.id_regex,
         )
+        if not sids:
+            print("error: no paired FASTQs discovered; cannot init metadata.", file=sys.stderr)
+            sys.exit(2)
+        write_metadata_template(sids, meta_path, [c.strip() for c in args.protected_cols.split(",") if c.strip()])
+        top_manifest = project_dir / "fastq.manifest"
+        generate_manifest(fastq_dir, top_manifest, strip_illumina_suffix=not args.keep_illumina_suffix, id_regex=args.id_regex)
         print("[ok] Wrote metadata + manifest. Fill primers, then re-run without --init-metadata.")
         return
 
     if not meta_path.exists():
         if getattr(args, "auto_init", True):
-            _generate_metadata_and_manifest(
-                fastq_dir=fastq_dir, project_dir=project_dir, metadata_file=meta_path,
-                protected_cols=args.protected_cols, keep_illumina_suffix=args.keep_illumina_suffix, id_regex=args.id_regex,
+            sids = paired_sample_ids(
+                discover_fastqs(fastq_dir),
+                strip_illumina_suffix=not args.keep_illumina_suffix,
+                id_regex=args.id_regex,
             )
+            if not sids:
+                print("error: no paired FASTQs discovered; cannot init metadata.", file=sys.stderr)
+                sys.exit(2)
+            write_metadata_template(sids, meta_path, [c.strip() for c in args.protected_cols.split(",") if c.strip()])
+            top_manifest = project_dir / "fastq.manifest"
+            generate_manifest(fastq_dir, top_manifest, strip_illumina_suffix=not args.keep_illumina_suffix, id_regex=args.id_regex)
         else:
             print(f"error: metadata not found: {meta_path}", file=sys.stderr); sys.exit(2)
 
+    # resume?
     merged_idx = project_dir / "MERGED.json"
     if getattr(args, "resume", False) and merged_idx.exists():
         args.skip_denoise = True
 
+    # denoise stage (optional)
     if not getattr(args, "skip_denoise", False):
         ns = SimpleNamespace(
             fastq_dir=fastq_dir, project_dir=project_dir, metadata_file=meta_path,
@@ -278,22 +210,24 @@ def run(args=None, **kwargs) -> None:
         cmd_denoise.run(ns)
 
     try:
-        merged_index = _load_merged_index(project_dir)
+        merged_index = load_merged_index(project_dir)
     except FileNotFoundError:
         print("error: MERGED.json not found; run denoise or use --resume only with existing project.", file=sys.stderr)
         sys.exit(3)
 
-    selected = _select_groups(merged_index, getattr(args, "groups", None))
+    selected = select_groups(merged_index, getattr(args, "groups", None))
     if not selected:
         print("error: no matching groups found.", file=sys.stderr); sys.exit(4)
 
-    # Resolve per-group classifier sources
+    # per-group classification
     classifiers_map: Optional[Dict[str, str]] = None
     if getattr(args, "classifiers_map", None):
-        try:
-            classifiers_map = _load_mapping_file(args.classifiers_map)
-        except Exception as e:
-            print(f"error: reading classifiers map: {e}", file=sys.stderr); sys.exit(5)
+        from qs.config.io import load_params_raw
+        data = load_params_raw(args.classifiers_map)
+        if "params" in data and isinstance(data["params"], dict) and isinstance(data["params"].get("classifiers_map"), dict):
+            classifiers_map = {str(k): str(v) for k, v in data["params"]["classifiers_map"].items() if v is not None}
+        else:
+            classifiers_map = {str(k): str(v) for k, v in data.items() if v is not None}
     elif params_typed and params_typed.classifiers_map:
         classifiers_map = {k: v for k, v in (params_typed.classifiers_map or {}).items() if v}
 
@@ -302,15 +236,15 @@ def run(args=None, **kwargs) -> None:
         for g in sorted(selected):
             gdir = Path(merged_index[g]["dir"])
             rep = gdir / "rep-seqs.qza"
-            slug = slugify(g if g else "all")
+            slug = gdir.name
 
             if getattr(args, "resume", False):
-                prior = _winner_if_present(gdir)
+                prior = winner_if_present(gdir)
                 if prior:
                     winners[g] = {"classifier_tag": prior, "priority": "resume"}
                     continue
 
-            src = _resolve_classifier_source(g, slug, mapping=classifiers_map, fallback_dir=args.classifiers_dir)
+            src = resolve_classifier_source(group_key=g, group_slug=slug, mapping=classifiers_map, fallback_dir=args.classifiers_dir)
             if not src:
                 LOG.info("No classifier for group=%s; skipping classification.", g); continue
             out = gdir / "classifiers"
@@ -361,7 +295,7 @@ def run(args=None, **kwargs) -> None:
             )
             table = f["table_final"]; rep = f["rep_seqs_final"]
 
-        stage_and_run_metrics_for_group(
+        core_dir = stage_and_run_metrics_for_group(
             group_dir=gdir, metadata_augmented=meta_aug, retain_fraction=args.retain_fraction, min_depth=args.min_depth,
             if_exists="skip", dry_run=getattr(args, "dry_run", False), show_qiime=getattr(args, "show_qiime", True),
             make_taxa_barplot=getattr(args, "taxa_barplot", True),

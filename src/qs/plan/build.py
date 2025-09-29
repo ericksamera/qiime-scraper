@@ -1,19 +1,11 @@
 # src/qs/plan/build.py
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set
 
 from qs.plan.types import GroupPlan, Plan
-from qs.utils.text import slugify
-
-
-def _load_merged_index(project_dir: Path) -> Dict[str, dict]:
-    idx = project_dir / "MERGED.json"
-    if not idx.exists():
-        raise FileNotFoundError(f"Missing {idx}")
-    return json.loads(idx.read_text())
+from qs.commands.common import load_merged_index, resolve_classifier_source
 
 
 def _select_groups(merged_index: Dict[str, dict], wanted: Optional[Iterable[str]]) -> Set[str]:
@@ -22,6 +14,8 @@ def _select_groups(merged_index: Dict[str, dict], wanted: Optional[Iterable[str]
     want = {str(g).strip() for g in wanted if str(g).strip()}
     if not want:
         return set(merged_index.keys())
+    # recreate slug mapping locally to avoid importing text utils here
+    from qs.utils.text import slugify
     slug_to_key = {slugify(k if k else "all"): k for k in merged_index}
     out: Set[str] = set()
     for g in want:
@@ -32,21 +26,6 @@ def _select_groups(merged_index: Dict[str, dict], wanted: Optional[Iterable[str]
     return out
 
 
-def _resolve_classifier_source(
-    *,
-    group_key: str,
-    group_slug: str,
-    classifiers_map: Optional[Dict[str, str]],
-    default_dir: Optional[Path],
-) -> Optional[Path]:
-    if classifiers_map:
-        for k in (group_key, group_slug, "default"):
-            v = classifiers_map.get(k)
-            if v:
-                return Path(v)
-    return default_dir
-
-
 def build_after_denoise(
     *,
     project_dir: Path,
@@ -54,7 +33,7 @@ def build_after_denoise(
     classifiers_map: Optional[Dict[str, str]],
     default_classifiers_dir: Optional[Path],
 ) -> Plan:
-    mi = _load_merged_index(project_dir)
+    mi = load_merged_index(project_dir)
     selected = _select_groups(mi, groups_requested)
     if not selected:
         raise ValueError("no matching groups found to operate on")
@@ -68,11 +47,11 @@ def build_after_denoise(
         rep = gdir / "rep-seqs.qza"
         tax = gdir / "taxonomy.qza"
         tax = tax if tax.exists() else None
-        src = _resolve_classifier_source(
+        src = resolve_classifier_source(
             group_key=key,
             group_slug=slug,
-            classifiers_map=classifiers_map,
-            default_dir=default_classifiers_dir,
+            mapping=classifiers_map,
+            fallback_dir=default_classifiers_dir,
         )
         gps.append(GroupPlan(
             key=key,

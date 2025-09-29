@@ -18,6 +18,7 @@ from qs.qiime import commands as qiime
 from qs.optimize.truncation import find_optimal_truncation
 from qs.primers.detect import detect_primers_for_samples
 from qs.primers.grouping import canonicalize_primer_pairs
+from qs.commands.common import to_ns
 
 LOG = get_logger("denoise")
 
@@ -46,7 +47,7 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--scan-kmax", type=int, default=24)
     p.add_argument("--scan-min-frac", type=float, default=0.30)
 
-    # NEW: grouping tolerance (IUPAC-aware edit distance)
+    # grouping tolerance (IUPAC-aware edit distance)
     p.add_argument("--group-edit-max", type=int, default=1,
                    help="Collapse primer pairs that differ by ≤ this many edits (IUPAC-aware). 0 = exact only.")
 
@@ -75,14 +76,10 @@ def setup_parser(subparsers, parent) -> None:
 
     p.set_defaults(func=run)
 
-def _to_ns(args=None, **kwargs) -> SimpleNamespace:
-    """Accept argparse-style positional or kwargs and normalize to a SimpleNamespace."""
-    if args is not None and not isinstance(args, SimpleNamespace):
-        return args  # argparse.Namespace works the same for getattr
-    return SimpleNamespace(**kwargs)
 
 def _group_key(f: str, r: str) -> str:
     return f"{f}|{r}" if f and r else ""
+
 
 def _collect_group_primers(rows: List[dict], f_col: str, r_col: str) -> Dict[str, Tuple[List[str], List[str]]]:
     by_group: Dict[str, Tuple[set, set]] = {}
@@ -97,8 +94,10 @@ def _collect_group_primers(rows: List[dict], f_col: str, r_col: str) -> Dict[str
             by_group[key][1].add(rv)
     return {k: (sorted(v[0]), sorted(v[1])) for k, v in by_group.items() if k}
 
+
 def _ensure_dir(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
+
 
 def _auto_or_fixed_trunc(
     *, run_path: Path, sub_root: Path, input_for_dada2: Path, args,
@@ -136,6 +135,7 @@ def _auto_or_fixed_trunc(
     )
     best = result["best"]  # type: ignore[index]
     return int(best["trunc_len_f"]), int(best["trunc_len_r"]), result  # type: ignore[index]
+
 
 def _autofill_and_normalize_groups(
     *, meta_aug: Path, fastq_dir: Path, id_regex: Optional[str], keep_illumina_suffix: bool,
@@ -183,9 +183,10 @@ def _autofill_and_normalize_groups(
             for r in rows:
                 w.writerow([r.get(col, "") for col in header])
 
+
 def run(args=None, **kwargs) -> None:
-    # Accept both call styles: func(args) or func(**vars(args))
-    args = _to_ns(args, **kwargs)
+    # Accept both call styles
+    args = to_ns(args, **kwargs)
 
     fastq_dir: Path = args.fastq_dir
     project_dir: Path = args.project_dir
@@ -213,7 +214,7 @@ def run(args=None, **kwargs) -> None:
             run_sid_map[sid] = run_id
 
     meta_aug = project_dir / "metadata.augmented.tsv"
-    header, _ = augment_metadata_with_runs_and_groups(
+    _, _ = augment_metadata_with_runs_and_groups(
         meta_in, meta_aug, run_by_sample_id=run_sid_map, f_col="__f_primer", r_col="__r_primer",
     )
     LOG.info("Wrote augmented metadata → %s", meta_aug)

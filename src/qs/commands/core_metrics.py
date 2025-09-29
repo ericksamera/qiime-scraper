@@ -1,7 +1,6 @@
 # src/qs/commands/core_metrics.py
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from typing import Dict, Optional, Set
@@ -9,8 +8,9 @@ from typing import Dict, Optional, Set
 from qs.utils.logger import get_logger
 from qs.analysis.metrics import stage_and_run_metrics_for_group, write_alpha_metrics_tsv
 from qs.analysis.filtering import compute_min_freq_from_qzv, filter_table_and_seqs
-from qs.utils.text import slugify
 from qs.qiime import commands as qiime
+from qs.commands.common import load_merged_index, select_groups
+from qs.analysis.stats import run_diversity_stats_for_group
 
 LOG = get_logger("coremetrics")
 
@@ -34,7 +34,7 @@ def setup_parser(subparsers, parent) -> None:
                    help="How to handle existing core-metrics-phylo directory.")
     p.add_argument("--alpha-tsv", action="store_true", help="Also write <group>/core-metrics-phylo/alpha-metrics.tsv.")
 
-    # Filtering toggles (NEW)
+    # Filtering toggles
     p.add_argument("--filter", dest="do_filter", action="store_true", help="Enable table filtering (default: on).")
     p.add_argument("--no-filter", dest="do_filter", action="store_false", help="Disable filtering.")
     p.set_defaults(do_filter=True)
@@ -53,40 +53,17 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--adonis-formula", type=str, default=None)
 
     # Taxa barplot toggle
-    p.add_argument("--taxa-barplot", dest="taxa_barplot", action="store_true", help="Render taxa-barplot.qzv if taxonomy exists.")
+    p.add_argument("--taxa-barplot", dest="taxa_barplot", action="true", help="Render taxa-barplot.qzv if taxonomy exists.")
     p.add_argument("--no-taxa-barplot", dest="taxa_barplot", action="store_false")
     p.set_defaults(taxa_barplot=True)
 
     p.set_defaults(func=run)
 
 
-def _load_merged_index(project_dir: Path) -> Dict[str, dict]:
-    idx = project_dir / "MERGED.json"
-    if not idx.exists():
-        raise FileNotFoundError(f"Missing {idx}")
-    return json.loads(idx.read_text())
-
-
-def _select_groups(merged_index: Dict[str, dict], groups_arg: Optional[str]) -> Set[str]:
-    if not groups_arg:
-        return set(merged_index.keys())
-    want = {g.strip() for g in groups_arg.split(",") if g.strip()}
-    if not want:
-        return set(merged_index.keys())
-    slug_to_key = {slugify(k if k else "all"): k for k in merged_index}
-    out: Set[str] = set()
-    for g in want:
-        if g in merged_index:
-            out.add(g); continue
-        if g in slug_to_key:
-            out.add(slug_to_key[g])
-    return out
-
-
 def run(args) -> None:
     project_dir: Path = args.project_dir
-    merged_index = _load_merged_index(project_dir)
-    groups = _select_groups(merged_index, args.groups)
+    merged_index = load_merged_index(project_dir)
+    groups = select_groups(merged_index, args.groups)
     if not groups:
         print("error: no matching groups found to operate on.", file=sys.stderr)
         sys.exit(2)
@@ -131,7 +108,6 @@ def run(args) -> None:
                 dry_run=getattr(args, "dry_run", False),
                 show_qiime=getattr(args, "show_qiime", True),
             )
-            # stage filtered artifacts as the inputs for metrics
             table = f["table_final"]
             rep_seqs = f["rep_seqs_final"]
 
@@ -148,7 +124,6 @@ def run(args) -> None:
 
         if args.run_stats:
             cols = [c.strip() for c in (args.beta_group_cols.split(",") if args.beta_group_cols else []) if c.strip()]
-            from qs.analysis.stats import run_diversity_stats_for_group
             run_diversity_stats_for_group(
                 group_dir=group_dir,
                 metadata_file=meta_aug,
