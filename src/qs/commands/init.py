@@ -1,74 +1,155 @@
 # src/qs/commands/init.py
 from __future__ import annotations
-
 import sys
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from qs.utils.logger import get_logger
 from qs.utils.samples import discover_fastqs, paired_sample_ids
 from qs.metadata import DEFAULT_PROTECTED_COLS
-from qs.metadata.template import write_metadata_template
+from qs.metadata.template import write_metadata_with_primers, write_metadata_template
+from qs.primers.detect import detect_groups_for_samples
+from qs.primers import degen
+from qs.utils.text import slugify
+from qs.config.io import write_params_and_plan
 
 LOG = get_logger("init")
-
 
 def setup_parser(subparsers, parent) -> None:
     p = subparsers.add_parser(
         "init", parents=[parent],
-        help="Scan FASTQs and write a QIIME2-style metadata TSV with protected primer columns.",
-        description=(
-            "Generate a metadata TSV with '#SampleID' and protected columns "
-            "prefixed by '__' (e.g., '__f_primer', '__r_primer'). "
-            "By default, SampleIDs drop Illumina tokens like _S1/_L001."
-        ),
+        help="Scan FASTQs, write metadata.tsv, and generate params.yaml with primer pairs & per-group classifier map.",
     )
-    p.add_argument("--fastq-dir", type=Path, required=True, help="Directory containing raw FASTQ(.gz) files.")
-    p.add_argument("--output-file", type=Path, required=True, help="Path to write metadata TSV (e.g., ./project/metadata.tsv).")
-    p.add_argument("--protected-cols", type=str, default="__f_primer,__r_primer",
-                   help="Comma-separated protected columns to include (default: __f_primer,__r_primer).")
-    p.add_argument("--keep-illumina-suffix", action="store_true",
-                   help="Keep _S#/_L### tokens in SampleIDs (default is to strip them).")
-    p.add_argument("--id-regex", type=str, default=None,
-                   help="Optional regex to extract SampleID from filename root; use group 'id' or group 1.")
-    p.add_argument("--force", action="store_true", help="Overwrite output file if it already exists.")
-    p.set_defaults(func=run)
+    p.add_argument("--fastq-dir", type=Path, required=True)
+    p.add_argument("--output-file", type=Path, required=True)
+    p.add_argument("--protected-cols", type=str, default="__f_primer,__r_primer")
+    p.add_argument("--keep-illumina-suffix", action="store_true")
+    p.add_argument("--id-regex", type=str, default=None)
+    p.add_argument("--force", action="store_true")
 
+    # Scan controls
+    p.add_argument("--auto-detect-primers", dest="auto_detect_primers", action="store_true")
+    p.add_argument("--no-auto-detect-primers", dest="auto_detect_primers", action="store_false")
+    p.set_defaults(auto_detect_primers=True)
+    p.add_argument("--scan-max-reads", type=int, default=4000)
+    p.add_argument("--scan-kmin", type=int, default=16)
+    p.add_argument("--scan-kmax", type=int, default=24)
+    p.add_argument("--scan-min-frac", type=float, default=0.30)
+
+    # YAML expansion limit
+    p.add_argument("--expand-limit", type=int, default=64)
+
+    # Params output
+    p.add_argument("--emit-params", dest="emit_params", action="store_true")
+    p.add_argument("--no-emit-params", dest="emit_params", action="store_false")
+    p.set_defaults(emit_params=True)
+    p.add_argument("--params-file", type=Path, default=None)
+
+    p.set_defaults(func=run)
 
 def _parse_protected(s: str) -> List[str]:
     cols = [c.strip() for c in s.split(",") if c.strip()]
     return cols or list(DEFAULT_PROTECTED_COLS)
 
+def _primer_group_summaries(
+    groups: Dict[str, List[str]],
+    per_sample: Dict[str, Tuple[str, str]],
+    expand_limit: int,
+) -> List[Dict[str, object]]:
+    out: List[Dict[str, object]] = []
+    for key, sids in sorted(groups.items()):
+        fvars = {per_sample[s][0] for s in sids if s in per_sample}
+        rvars = {per_sample[s][1] for s in sids if s in per_sample}
+        fsum = degen.summarize_variants(sorted(fvars), expand_limit=expand_limit)
+        rsum = degen.summarize_variants(sorted(rvars), expand_limit=expand_limit)
+        out.append({
+            "group_key": key,
+            "group_slug": slugify(key if key else "all"),
+            "n_samples": len(sids),
+            "forward": fsum,
+            "reverse": rsum,
+        })
+    return out
 
 def run(args) -> None:
     fastq_dir: Path = args.fastq_dir
-    output_file: Path = args.output_file
-    protected_cols: List[str] = _parse_protected(args.protected_cols)
-    id_regex: Optional[str] = args.id_regex
-    strip_illumina_suffix: bool = not args.keep_illumina_suffix
+    meta_out: Path = args.output_file
+    strip = not args.keep_illumina_suffix
 
-    if output_file.exists() and not args.force:
-        LOG.error("Refusing to overwrite existing file: %s (use --force)", output_file)
-        print(f"error: {output_file} exists (use --force)", file=sys.stderr)
+    if meta_out.exists() and not args.force:
+        LOG.error("Refusing to overwrite: %s (use --force)", meta_out)
+        print(f"error: {meta_out} exists (use --force)", file=sys.stderr)
         sys.exit(1)
 
-    fastqs = discover_fastqs(fastq_dir)
-    if not fastqs:
-        LOG.error("No FASTQ files found under %s", fastq_dir)
-        print(f"error: no FASTQ files found under {fastq_dir}", file=sys.stderr)
+    paths = discover_fastqs(fastq_dir)
+    if not paths:
+        print(f"error: no FASTQ files under {fastq_dir}", file=sys.stderr)
         sys.exit(3)
 
-    sample_ids = paired_sample_ids(
-        fastqs,
-        strip_illumina_suffix=strip_illumina_suffix,
-        id_regex=id_regex,
-    )
+    sample_ids = paired_sample_ids(paths, strip_illumina_suffix=strip, id_regex=args.id_regex)
     if not sample_ids:
-        LOG.error("Found FASTQs but no R1/R2 pairs; check naming conventions.")
         print("error: no paired R1/R2 FASTQs detected; check filenames.", file=sys.stderr)
         sys.exit(4)
 
-    LOG.info("Discovered %d paired samples.", len(sample_ids))
-    write_metadata_template(sample_ids, output_file, protected_cols)
-    LOG.info("Metadata written → %s", output_file)
-    print(f"[ok] Wrote metadata with {len(sample_ids)} samples: {output_file}")
+    groups: Dict[str, List[str]] = {}
+    per_sample: Dict[str, Tuple[str, str]] = {}
+
+    if args.auto_detect_primers:
+        groups, per_sample = detect_groups_for_samples(
+            fastq_dir, sample_ids,
+            strip_illumina_suffix=strip, id_regex=args.id_regex,
+            kmin=args.scan_kmin, kmax=args.scan_kmax, max_reads=args.scan_max_reads, min_fraction=args.scan_min_frac,
+        )
+        LOG.info("Primer detection: confident calls for %d/%d samples.", len(per_sample), len(sample_ids))
+
+    # Write metadata
+    if per_sample:
+        write_metadata_with_primers(sample_ids, meta_out, per_sample, _parse_protected(args.protected_cols))
+    else:
+        write_metadata_template(sample_ids, meta_out, _parse_protected(args.protected_cols))
+    print(f"[ok] metadata → {meta_out}")
+
+    # Write params + plan (robust, typed schema on read)
+    if args.emit_params:
+        params_path = args.params_file or (meta_out.parent / "params.yaml")
+
+        # defaults snapshot aligned with auto-run
+        params = {
+            "resume": True,
+            "split_by_primer_group": (len([k for k in groups if k]) > 1),
+            "cores": 0,
+            "discard_untrimmed": False,
+            "no_indels": False,
+            "auto_trunc": False,
+            "trunc_len_f": 0, "trunc_len_r": 0,
+            "trunc_lower_frac": 0.80, "trunc_min_len": 50, "trunc_step": 10, "trunc_refine_step": 5, "trunc_quick_learn": 250000,
+            "trim_left_f": 0, "trim_left_r": 0, "max_ee_f": 2, "max_ee_r": 2, "trunc_q": 2, "min_overlap": 12,
+            "pooling_method": "independent", "chimera_method": "consensus",
+            "do_filter": True, "rare_freq_frac": 0.001, "rare_min_samples": 1,
+            "contam_exclude": "mitochondria,chloroplast", "filter_unclassified_phylum": False, "min_sample_depth": 0,
+            "retain_fraction": 0.90, "min_depth": 1000, "alpha_tsv": False, "taxa_barplot": True,
+            "run_stats": False, "beta_group_cols": ["primer_group"], "beta_method": "permanova", "pairwise": False,
+            "permutations": 999, "adonis_formula": None,
+            "show_qiime": True,
+            # NEW knobs:
+            "classifiers_map": { (slugify(k) if k else "all"): None for k in groups } | {"default": None},
+            "primer_pairs": {
+                (slugify(k) if k else "all"): {
+                    "forward_iupac": degen.summarize_variants([k.split("|")[0]], expand_limit=args.expand_limit)["consensus_iupac"] if k else "",
+                    "reverse_iupac": degen.summarize_variants([k.split("|")[1]], expand_limit=args.expand_limit)["consensus_iupac"] if k and "|" in k else "",
+                } for k in groups
+            },
+        }
+
+        plan = {
+            "generated": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "detected_groups_n": len([k for k in groups if k]),
+            "primer_pairs": _primer_group_summaries(groups, per_sample, args.expand_limit),
+            "detected_primers_per_sample": per_sample,
+            "suggested_command": "qs auto-run --fastq-dir <FASTQ_DIR> --params " + params_path.name,
+            "notes": "Set params.classifiers_map per primer group slug to either a directory (sweep) or a single .qza classifier (fixed).",
+        }
+
+        write_params_and_plan(params_path, params, plan)
+        print(f"[ok] params → {params_path}")
