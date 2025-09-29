@@ -12,7 +12,54 @@ from qs.analysis.staging import (
     _repair_table,
 )
 from qs.qiime import commands as qiime
-from qs.analysis.depth import choose_sampling_depth
+from qs.analysis.depth import choose_sampling_depth, choose_depth_and_count, max_depth_with_at_least
+
+
+def _alpha_only_core(
+    *,
+    group_dir: Path,
+    metadata_augmented: Path,
+    rooted_tree: Path,
+    depth: int,
+    dry_run: bool,
+    show_qiime: bool,
+) -> Path:
+    """
+    Build a minimal 'core-metrics-phylo' directory containing:
+      - rarefied table at the chosen depth
+      - alpha vectors: observed_features, shannon, evenness (pielou_e), faith_pd
+    No beta distances/PCoA are created, so downstream ordination steps won't run.
+    """
+    core_dir = group_dir / "core-metrics-phylo"
+    core_dir.mkdir(parents=True, exist_ok=True)
+
+    # Rarefy table first (mirror core-metrics behavior)
+    rare = core_dir / f"rarefied_table_{depth}.qza"
+    qiime.feature_table_rarefy(
+        input_table=group_dir / "table.qza",
+        sampling_depth=depth,
+        output_table=rare,
+        dry_run=dry_run,
+        show_stdout=show_qiime,
+    )
+
+    # Alpha vectors on the rarefied table
+    qiime.diversity_alpha(input_table=rare, metric="observed_features",
+                          output_vector=core_dir / "observed_features_vector.qza",
+                          dry_run=dry_run, show_stdout=show_qiime)
+    qiime.diversity_alpha(input_table=rare, metric="shannon",
+                          output_vector=core_dir / "shannon_vector.qza",
+                          dry_run=dry_run, show_stdout=show_qiime)
+    # 'evenness' comes from metric 'pielou_e'
+    qiime.diversity_alpha(input_table=rare, metric="pielou_e",
+                          output_vector=core_dir / "evenness_vector.qza",
+                          dry_run=dry_run, show_stdout=show_qiime)
+    qiime.diversity_alpha_phylogenetic(
+        input_table=rare, input_phylogeny=rooted_tree, metric="faith_pd",
+        output_vector=core_dir / "faith_pd_vector.qza",
+        dry_run=dry_run, show_stdout=show_qiime,
+    )
+    return core_dir
 
 
 def stage_and_run_metrics_for_group(
@@ -29,7 +76,8 @@ def stage_and_run_metrics_for_group(
     """
     Ensure rep-seqs/table exist in group_dir (prefer filtered *_final.qza if present),
     optionally emit taxa-barplot if taxonomy.qza is present,
-    then build phylogeny and run core metrics.
+    then build phylogeny and run core metrics. If ordination would fail due to
+    too-few samples, automatically fall back to an alpha-only core.
     """
     group_dir.mkdir(parents=True, exist_ok=True)
     slug = group_dir.name
@@ -85,7 +133,26 @@ def stage_and_run_metrics_for_group(
             dry_run=dry_run,
             show_stdout=show_qiime,
         )
-    depth = choose_sampling_depth(table_qzv, retain_fraction=retain_fraction, min_depth=min_depth)
+
+    # Choose a depth and see how many samples would survive at that depth
+    depth, n_retained = choose_depth_and_count(table_qzv, retain_fraction=retain_fraction, min_depth=min_depth)
+
+    # If none survive, reduce depth down to the largest value retaining at least 1 sample
+    if n_retained == 0:
+        depth = max_depth_with_at_least(table_qzv, 1, floor=1)
+        n_retained = 1  # by construction
+
+    # If < 3 samples would be retained, core-metrics will fail on PCoA/Emperor.
+    # Fall back to alpha-only pipeline at 'depth'.
+    if n_retained < 3:
+        return _alpha_only_core(
+            group_dir=group_dir,
+            metadata_augmented=metadata_augmented,
+            rooted_tree=rooted,
+            depth=depth,
+            dry_run=dry_run,
+            show_qiime=show_qiime,
+        )
 
     core_dir = group_dir / "core-metrics-phylo"
     if core_dir.exists():
@@ -100,16 +167,29 @@ def stage_and_run_metrics_for_group(
         elif if_exists == "error":
             raise FileExistsError(core_dir)
 
-    qiime.diversity_core_metrics_phylogenetic(
-        input_phylogeny=rooted,
-        input_table=group_dir / "table.qza",
-        sampling_depth=depth,
-        metadata_file=metadata_augmented,
-        output_dir=core_dir,
-        dry_run=dry_run,
-        show_stdout=show_qiime,
-    )
-    return core_dir
+    # Try the standard pipeline; if it fails (e.g., any ordination edge case),
+    # automatically fall back to alpha-only.
+    try:
+        qiime.diversity_core_metrics_phylogenetic(
+            input_phylogeny=rooted,
+            input_table=group_dir / "table.qza",
+            sampling_depth=depth,
+            metadata_file=metadata_augmented,
+            output_dir=core_dir,
+            dry_run=dry_run,
+            show_stdout=show_qiime,
+        )
+        return core_dir
+    except Exception as e:
+        # Graceful fallback: alpha-only metrics so downstream stats can still run
+        return _alpha_only_core(
+            group_dir=group_dir,
+            metadata_augmented=metadata_augmented,
+            rooted_tree=rooted,
+            depth=depth,
+            dry_run=dry_run,
+            show_qiime=show_qiime,
+        )
 
 
 def write_alpha_metrics_tsv(core_metrics_dir: Path, out_tsv: Optional[Path] = None) -> Path:

@@ -375,6 +375,63 @@ def taxa_barplot(
     run_command(cmd, dry_run=dry_run, capture=not show_stdout)
 
 
+def feature_table_rarefy(
+    *,
+    input_table: Path,
+    sampling_depth: int,
+    output_table: Path,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd = [
+        "qiime", "feature-table", "rarefy",
+        "--i-table", str(input_table),
+        "--p-sampling-depth", str(int(sampling_depth)),
+        "--o-rarefied-table", str(output_table),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+# ---------------------------
+# Alpha diversity (NEW)
+# ---------------------------
+
+def diversity_alpha(
+    *,
+    input_table: Path,
+    metric: str,
+    output_vector: Path,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd = [
+        "qiime", "diversity", "alpha",
+        "--i-table", str(input_table),
+        "--p-metric", str(metric),
+        "--o-alpha-diversity", str(output_vector),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
+def diversity_alpha_phylogenetic(
+    *,
+    input_table: Path,
+    input_phylogeny: Path,
+    metric: str,
+    output_vector: Path,
+    dry_run: bool = False,
+    show_stdout: bool = False,
+) -> None:
+    cmd = [
+        "qiime", "diversity", "alpha-phylogenetic",
+        "--i-table", str(input_table),
+        "--i-phylogeny", str(input_phylogeny),
+        "--p-metric", str(metric),
+        "--o-alpha-diversity", str(output_vector),
+    ]
+    run_command(cmd, dry_run=dry_run, capture=not show_stdout)
+
+
 def diversity_alpha_group_significance(
     *,
     alpha_diversity: Path,
