@@ -34,18 +34,18 @@ _DEFAULTS: Dict[str, Any] = {
     "run_stats": False, "beta_group_cols": None, "beta_method": "permanova", "pairwise": False, "permutations": 999,
     "adonis_formula": None,
     "dry_run": False, "show_qiime": True,
-    # NEW default used when forwarding to denoise
+    # forward to denoise
     "group_edit_max": 1,
 }
 
 def setup_parser(subparsers, parent) -> None:
     p = subparsers.add_parser(
         "auto-run", parents=[parent],
-        help="End-to-end: init (optional) → per-run/group import+cutadapt+DADA2 → merge → classify (per-group map or sweep) → filter → metrics (+stats).",
+        help="End-to-end: init (optional) → per-run/group import+cutadapt+DADA2 → merge → classify → filter → metrics (+stats).",
     )
-    p.add_argument("--fastq-dir", type=Path, required=True)
-    p.add_argument("--project-dir", type=Path, default=None)
-    p.add_argument("--metadata-file", type=Path, default=None)
+    p.add_argument("--fastq-dir", type=Path, required=True, help="Top FASTQ directory; subfolders are runs.")
+    p.add_argument("--project-dir", type=Path, default=None, help="Project directory (default: <fastq-parent>/<fastq-name>-qs).")
+    p.add_argument("--metadata-file", type=Path, default=None, help="Metadata TSV (default: <project-dir>/metadata.tsv).")
     p.add_argument("--params", type=Path, default=None, help="YAML/JSON with 'params' and optional 'plan'")
     p.add_argument("--auto-init", dest="auto_init", action="store_true")
     p.add_argument("--no-auto-init", dest="auto_init", action="store_false")
@@ -91,7 +91,8 @@ def setup_parser(subparsers, parent) -> None:
 
     # Classifiers
     p.add_argument("--classifiers-dir", type=Path, default=None)
-    p.add_argument("--classifiers-map", type=Path, default=None, help="YAML/JSON mapping slug|key|default -> dir|.qza")
+    p.add_argument("--classifiers-map", type=Path, default=None,
+                   help="YAML/JSON mapping slug|key|default -> dir|.qza")
 
     # Filtering / metrics / stats
     p.add_argument("--filter", dest="do_filter", action="store_true")
@@ -118,15 +119,43 @@ def setup_parser(subparsers, parent) -> None:
     p.add_argument("--no-taxa-barplot", dest="taxa_barplot", action="store_false")
     p.set_defaults(taxa_barplot=True)
 
-    # NEW: expose grouping tolerance here too (forwarded to denoise)
+    # Grouping tolerance (forwarded to denoise)
     p.add_argument("--group-edit-max", type=int, default=_DEFAULTS["group_edit_max"],
                    help="Collapse primer pairs that differ by ≤ this many edits (IUPAC-aware). 0 = exact only.")
 
     p.set_defaults(func=run)
 
+
+# --- helpers ------------------------------------------------------------------
+
+def _to_ns(args=None, **kwargs) -> SimpleNamespace:
+    """Accept argparse-style positional or kwargs and normalize to a SimpleNamespace."""
+    if args is not None and not isinstance(args, SimpleNamespace):
+        return args  # argparse.Namespace is fine
+    return SimpleNamespace(**kwargs)
+
 def _derive_default_project_dir(fastq_dir: Path) -> Path:
     fd = fastq_dir.resolve()
     return fd.parent / f"{fd.name}-qs"
+
+def _ensure_fastq_dir(args) -> Path:
+    """
+    Guarantee we have a Path for fastq_dir.
+    - If present on args, use it.
+    - Else, if ./fastq exists, use that (common case).
+    - Else, fail with a clear message instead of AttributeError.
+    """
+    v = getattr(args, "fastq_dir", None)
+    if isinstance(v, Path):
+        return v
+    if isinstance(v, str) and v:
+        return Path(v)
+    default = Path("fastq")
+    if default.is_dir():
+        return default
+    print("error: --fastq-dir is required and was not found on the invocation. "
+          "Pass it explicitly (e.g., --fastq-dir ./fastq).", file=sys.stderr)
+    sys.exit(2)
 
 def _generate_metadata_and_manifest(*, fastq_dir: Path, project_dir: Path, metadata_file: Path,
                                     protected_cols: str, keep_illumina_suffix: bool, id_regex: Optional[str]) -> None:
@@ -184,12 +213,8 @@ def _load_mapping_file(path: Path) -> Dict[str, str]:
         return {str(k): str(v) for k, v in data["params"]["classifiers_map"].items() if v is not None}
     return {str(k): str(v) for k, v in data.items() if v is not None}
 
-def _to_ns(args=None, **kwargs) -> SimpleNamespace:
-    """Accept argparse-style positional or kwargs and normalize to a SimpleNamespace."""
-    if args is not None and not isinstance(args, SimpleNamespace):
-        # Usually argparse.Namespace; that's fine too
-        return args  # type: ignore[return-value]
-    return SimpleNamespace(**kwargs)
+
+# --- entrypoint ---------------------------------------------------------------
 
 def run(args=None, **kwargs) -> None:
     # Accept both call styles: func(args) or func(**vars(args))
@@ -207,9 +232,10 @@ def run(args=None, **kwargs) -> None:
             print(f"error: reading params {args.params}: {e}", file=sys.stderr)
             sys.exit(2)
 
-    fastq_dir: Path = args.fastq_dir
-    project_dir: Path = args.project_dir or _derive_default_project_dir(fastq_dir)
-    meta_path: Path = args.metadata_file or (project_dir / "metadata.tsv")
+    # >>> robustly acquire fastq_dir (prevents AttributeError)
+    fastq_dir: Path = _ensure_fastq_dir(args)
+    project_dir: Path = (args.project_dir or _derive_default_project_dir(fastq_dir))
+    meta_path: Path = (args.metadata_file or (project_dir / "metadata.tsv"))
     project_dir.mkdir(parents=True, exist_ok=True)
 
     if getattr(args, "init_metadata", False):
@@ -247,7 +273,6 @@ def run(args=None, **kwargs) -> None:
             trunc_q=args.trunc_q, min_overlap=args.min_overlap, pooling_method=args.pooling_method, chimera_method=args.chimera_method,
             dry_run=getattr(args, "dry_run", False), show_qiime=getattr(args, "show_qiime", True),
             auto_detect_primers=True, scan_max_reads=4000, scan_kmin=16, scan_kmax=24, scan_min_frac=0.30,
-            # NEW: forward grouping tolerance (default 1 if not supplied)
             group_edit_max=getattr(args, "group_edit_max", _DEFAULTS["group_edit_max"]),
         )
         cmd_denoise.run(ns)

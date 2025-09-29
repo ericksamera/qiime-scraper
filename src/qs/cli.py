@@ -15,6 +15,18 @@ from qs.commands import classify_sweep as cmd_cls
 from qs.commands import auto_run as cmd_auto
 from qs.commands import core_metrics as cmd_metrics
 
+def _safe_call(func, args: argparse.Namespace) -> None:
+    """
+    Be robust to modules that expose run(args) vs run(**kwargs).
+    Prefer the normal positional call; fall back to kwargs if the
+    handler rejects positional args.
+    """
+    try:
+        return func(args)
+    except TypeError:
+        # Some handlers are defined as run(**kwargs)
+        return func(**vars(args))
+
 def main() -> None:
     logger = setup_logger()
     parser = argparse.ArgumentParser(
@@ -45,4 +57,4 @@ def main() -> None:
 
     args = parser.parse_args()
     logger.debug("Parsed args: %r", args)
-    args.func(args)
+    _safe_call(args.func, args)
